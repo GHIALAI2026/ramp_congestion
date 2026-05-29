@@ -1,0 +1,3825 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Vehicle Zone Intelligence</title>
+<link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+<link rel="shortcut icon" href="/static/favicon.svg">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --bg:#f8fafc;
+  --panel:#ffffff;
+  --panel-2:#f8fafc;
+  --line:#e5e7eb;
+  --line-2:#dbe4f0;
+  --text:#0f172a;
+  --muted:#64748b;
+  --muted-2:#94a3b8;
+  --blue:#2563eb;
+  --blue-soft:#eff6ff;
+  --green:#16a34a;
+  --green-soft:#ecfdf5;
+  --amber:#d97706;
+  --amber-soft:#fff7ed;
+  --red:#dc2626;
+  --red-soft:#fef2f2;
+  --shadow:0 10px 25px rgba(15,23,42,.06);
+}
+html,body{height:100%}
+body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);display:flex;overflow:hidden}
+a{color:inherit}
+.app-shell{display:flex;flex:1;min-width:0}
+.sidebar{
+  width:220px;background:var(--panel);border-right:1px solid var(--line);
+  display:flex;flex-direction:column;flex-shrink:0
+}
+.brand{
+  height:80px;display:flex;align-items:center;justify-content:center;padding:0 12px;border-bottom:1px solid var(--line)
+}
+.brand-logo{height:64px;width:auto;max-width:100%;object-fit:contain;display:block}
+.nav{flex:1;overflow-y:auto;padding:14px 8px}
+.nav-section{font-size:10px;text-transform:uppercase;letter-spacing:.14em;color:var(--muted-2);padding:8px 10px 6px}
+.nav a{
+  display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:10px;
+  text-decoration:none;color:var(--muted);font-size:14px;font-weight:500;transition:.15s ease
+}
+.nav a:hover{background:#f3f6fb;color:var(--text)}
+.nav a.active{background:var(--blue-soft);color:#1d4ed8}
+.nav-ic{width:18px;text-align:center;opacity:.9}
+.live-dot{width:8px;height:8px;border-radius:999px;background:currentColor}
+
+.workspace{flex:1;display:flex;flex-direction:column;min-width:0}
+.header{
+  height:56px;background:var(--panel);border-bottom:1px solid var(--line);display:flex;
+  align-items:center;padding:0 24px;gap:16px;flex-shrink:0
+}
+.header-title{font-size:18px;font-weight:700;color:#111827}
+.header-meta{margin-left:auto;display:flex;align-items:center;gap:18px}
+.ws-state{display:flex;align-items:center;gap:8px;font-size:12px;font-weight:600}
+.ws-state.ok{color:var(--green)}
+.ws-state.err{color:var(--red)}
+.clock{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}
+
+/* Notification bell + badge */
+.bell-btn{
+  position:relative;display:inline-flex;align-items:center;justify-content:center;
+  width:34px;height:34px;border-radius:10px;border:1px solid var(--line);
+  background:#fff;cursor:pointer;font-size:16px;line-height:1;color:#0f172a;
+  transition:background .12s ease, border-color .12s ease, transform .12s ease
+}
+.bell-btn:hover{background:#f1f5f9;border-color:#cbd5e1}
+.bell-btn.has-unacked{animation:bellPulse 1.6s ease-in-out infinite}
+.bell-icon{display:inline-block;line-height:1}
+.bell-badge{
+  position:absolute;top:-4px;right:-6px;min-width:18px;height:18px;padding:0 5px;
+  border-radius:999px;background:#dc2626;color:#fff;font-size:10px;font-weight:700;
+  display:inline-flex;align-items:center;justify-content:center;
+  font-variant-numeric:tabular-nums;border:2px solid #fff;line-height:1
+}
+.bell-badge[hidden]{display:none}
+@keyframes bellPulse{
+  0%,100%{box-shadow:0 0 0 0 rgba(220,38,38,0)}
+  50%{box-shadow:0 0 0 6px rgba(220,38,38,.18)}
+}
+
+/* Slide-in alert drawer */
+.drawer-scrim{
+  position:fixed;inset:0;background:rgba(15,23,42,.32);z-index:90;
+  opacity:0;transition:opacity .2s ease;pointer-events:none
+}
+.drawer-scrim.show{opacity:1;pointer-events:auto}
+.drawer-scrim[hidden]{display:none}
+.alert-drawer{
+  position:fixed;top:0;right:0;width:380px;max-width:95vw;height:100vh;
+  background:#fff;border-left:1px solid var(--line);
+  box-shadow:-12px 0 32px -16px rgba(15,23,42,.18);
+  z-index:100;display:flex;flex-direction:column;
+  transform:translateX(100%);transition:transform .25s ease
+}
+.alert-drawer.open{transform:translateX(0)}
+.alert-drawer-head{
+  padding:16px 18px;border-bottom:1px solid var(--line);
+  display:flex;align-items:flex-start;justify-content:space-between;gap:12px
+}
+.alert-drawer-title{font-size:16px;font-weight:700;color:#111827}
+.alert-drawer-sub{font-size:12px;color:var(--muted);margin-top:4px}
+.alert-drawer-body{flex:1;overflow:auto;padding:14px 16px}
+.alert-drawer-foot{
+  padding:12px 18px;border-top:1px solid var(--line);
+  display:flex;justify-content:flex-end
+}
+
+/* Toast stack (top-right). Offset 130px from the top so it clears
+   the persistent header AND the per-page toolbar — without that gap
+   incoming toasts would fly in right on top of the Live View camera
+   dropdown which lives in the page-head's right corner. New toasts
+   appear at the top of the stack (column direction), older ones get
+   pushed down. */
+.toast-stack{
+  position:fixed;top:130px;right:18px;z-index:80;
+  display:flex;flex-direction:column;gap:10px;pointer-events:none
+}
+.toast{
+  pointer-events:auto;width:340px;max-width:90vw;
+  background:#fff;border:1px solid var(--line);border-left:4px solid #cbd5e1;
+  border-radius:12px;box-shadow:0 10px 24px -10px rgba(15,23,42,.18);
+  padding:12px 14px;display:flex;align-items:flex-start;gap:10px;cursor:pointer;
+  opacity:0;transform:translateX(20px);
+  animation:toastIn .25s ease forwards
+}
+.toast.critical{border-left-color:#dc2626}
+.toast.warning{border-left-color:#d97706}
+.toast.fading{animation:toastOut .35s ease forwards}
+@keyframes toastIn{to{opacity:1;transform:translateX(0)}}
+@keyframes toastOut{to{opacity:0;transform:translateX(20px)}}
+.toast-badge{
+  flex-shrink:0;padding:3px 8px;border-radius:6px;font-size:10px;font-weight:700;
+  text-transform:uppercase;letter-spacing:.04em
+}
+.toast-badge.critical{background:var(--red-soft);color:var(--red)}
+.toast-badge.warning{background:var(--amber-soft);color:var(--amber)}
+.toast-body{flex:1;min-width:0}
+.toast-msg{font-size:13px;color:#1f2937;line-height:1.4;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.toast-meta{font-size:11px;color:var(--muted);margin-top:4px}
+
+.content{flex:1;overflow-y:auto;padding:24px}
+.page{display:none}
+.page.active{display:block}
+.page-head{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:18px}
+.page-title{font-size:18px;font-weight:700;color:#111827}
+.page-sub{font-size:13px;color:var(--muted);margin-top:4px}
+
+.btn{
+  display:inline-flex;align-items:center;gap:8px;padding:9px 14px;border-radius:10px;
+  border:1px solid var(--line-2);background:var(--panel);color:var(--muted);
+  cursor:pointer;font-size:13px;font-weight:600;transition:.15s ease;text-decoration:none
+}
+.btn:hover{border-color:#cbd5e1;background:#f8fafc;color:var(--text)}
+.btn.primary{background:var(--blue);border-color:var(--blue);color:#fff}
+.btn.primary:hover{background:#1d4ed8;border-color:#1d4ed8}
+.btn.danger:hover{color:var(--red);border-color:#fecaca;background:#fff5f5}
+
+.metrics{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:16px}
+.metric-card{
+  background:var(--panel);border:1px solid var(--line);border-left:4px solid #cbd5e1;border-radius:16px;
+  padding:18px;box-shadow:var(--shadow)
+}
+.metric-card.blue{border-left-color:#2563eb}
+.metric-card.green{border-left-color:#16a34a}
+.metric-card.amber{border-left-color:#d97706}
+.metric-card.red{border-left-color:#dc2626}
+.metric-label{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted-2);margin-bottom:10px}
+.metric-value{font-size:34px;line-height:1;font-weight:800;color:#0f172a;font-variant-numeric:tabular-nums}
+.metric-value.blue{color:#2563eb}
+.metric-value.green{color:#16a34a}
+.metric-value.amber{color:#d97706}
+.metric-value.red{color:#dc2626}
+.metric-note{margin-top:10px;font-size:12px;color:var(--muted)}
+.metric-card.kpi-primary{border-left-width:6px}
+.metric-card.kpi-primary .metric-value{font-size:48px}
+.metric-card.kpi-primary.red{background:linear-gradient(180deg,#fff7f7,#fef2f2)}
+.metric-card.clickable{cursor:pointer;transition:transform .12s ease, box-shadow .12s ease}
+.metric-card.clickable:hover{transform:translateY(-2px);box-shadow:0 6px 18px rgba(15,23,42,.10)}
+
+.summary-panel{margin-top:18px}
+.summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}
+.summary-grid.hotspots{grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
+.occupancy-segment{
+  flex:1 1 0;min-width:0;padding:14px 16px;border-radius:12px;border:1px solid var(--line);
+  background:#fbfdff;display:flex;flex-direction:column;gap:8px
+}
+.occupancy-segment.green{background:linear-gradient(180deg,#f8fffb,#f0fdf4)}
+.occupancy-segment.amber{background:linear-gradient(180deg,#fffaf2,#fff7ed)}
+.occupancy-segment.red{background:linear-gradient(180deg,#fff7f7,#fef2f2)}
+.occupancy-seg-top{display:flex;align-items:baseline;justify-content:space-between;gap:8px}
+.occupancy-seg-label{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#111827}
+.occupancy-seg-share{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}
+.occupancy-seg-count{font-size:30px;font-weight:800;line-height:1;color:#0f172a;font-variant-numeric:tabular-nums}
+.occupancy-seg-count.green{color:#16a34a}
+.occupancy-seg-count.amber{color:#d97706}
+.occupancy-seg-count.red{color:#dc2626}
+.occupancy-seg-range{font-size:11px;color:var(--muted-2)}
+.summary-grid.hotspots .summary-card{box-shadow:0 4px 14px rgba(15,23,42,.06)}
+.summary-section-head{display:flex;align-items:baseline;gap:10px;margin-bottom:10px}
+.summary-section-title{font-size:13px;font-weight:700;color:#111827;text-transform:uppercase;letter-spacing:.06em}
+.summary-section-sub{font-size:12px;color:var(--muted)}
+
+.analytics-toolbar{display:flex;flex-wrap:wrap;gap:18px;align-items:center}
+.analytics-toolgroup{display:flex;align-items:center;gap:10px}
+.analytics-toolgroup-label{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted-2);font-weight:700}
+.analytics-pillrow{display:inline-flex;border:1px solid var(--line);border-radius:999px;padding:3px;background:#f8fafc}
+.analytics-pill{
+  border:none;background:transparent;padding:6px 14px;border-radius:999px;
+  font:inherit;font-size:12px;font-weight:600;color:var(--muted);cursor:pointer;
+  transition:background .12s ease, color .12s ease
+}
+.analytics-pill:hover{color:#0f172a}
+.analytics-pill.is-active{background:#fff;color:#0f172a;box-shadow:0 1px 2px rgba(15,23,42,.06)}
+
+.analytics-grid{display:grid;grid-template-columns:1fr;gap:16px}
+.analytics-total{font-size:28px;font-weight:800;color:#0f172a;font-variant-numeric:tabular-nums;line-height:1}
+.analytics-chart{display:grid;grid-template-columns:60px 1fr;grid-template-rows:1fr auto;gap:6px;min-height:300px;padding:0}
+.analytics-chart > .analytics-xaxis-title{grid-column:1 / -1}
+.analytics-yaxis{position:relative;min-width:60px}
+.analytics-yaxis-inner{position:absolute;left:0;right:0;top:24px;bottom:28px}
+.analytics-yaxis-title{
+  position:absolute;top:4px;left:0;right:8px;text-align:right;
+  font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted-2);font-weight:700
+}
+.analytics-ytick{
+  position:absolute;right:8px;transform:translateY(50%);
+  font-size:11px;color:var(--muted-2);font-variant-numeric:tabular-nums;white-space:nowrap
+}
+.analytics-total-unit{font-size:13px;font-weight:600;color:var(--muted);margin-left:4px;letter-spacing:.01em}
+.analytics-plot{position:relative;display:flex;flex-direction:column;min-width:0}
+.analytics-gridlines{position:absolute;left:0;right:0;top:24px;bottom:28px;pointer-events:none;z-index:0}
+.analytics-gridline{position:absolute;left:0;right:0;height:1px;background:#eef2f7}
+.analytics-gridline.baseline{background:#cbd5e1;height:1px}
+.analytics-bars{flex:1;display:flex;align-items:flex-end;gap:6px;padding:24px 6px 28px;position:relative;z-index:1}
+.analytics-bar-cell{flex:1 1 0;min-width:0;display:flex;flex-direction:column;align-items:stretch;position:relative;height:100%}
+.analytics-bar-track{flex:1;display:flex;align-items:flex-end}
+.analytics-bar-fill{
+  width:100%;background:linear-gradient(180deg,#dc2626,#b91c1c);border-radius:4px 4px 0 0;
+  min-height:0;position:relative;transition:height .25s ease
+}
+.analytics-bar-fill.zero{background:transparent;min-height:0}
+.analytics-bar-fill.amber{background:linear-gradient(180deg,#f59e0b,#d97706)}
+.analytics-bar-value{
+  position:absolute;top:-20px;left:50%;transform:translateX(-50%);
+  font-size:11px;font-weight:700;color:#0f172a;font-variant-numeric:tabular-nums
+}
+/* Label is absolutely placed below the bar so it does NOT consume vertical space
+   inside the cell. This keeps the bar-track flush with the chart's 0-baseline. */
+.analytics-bar-label{
+  position:absolute;top:100%;left:0;right:0;margin-top:6px;
+  font-size:10px;text-align:center;color:var(--muted);
+  white-space:nowrap;overflow:visible
+}
+.analytics-xaxis-title{
+  text-align:center;font-size:11px;color:var(--muted-2);
+  text-transform:uppercase;letter-spacing:.06em;font-weight:700;
+  margin-top:8px;padding:6px 4px 0
+}
+.analytics-chart.rotate-labels .analytics-yaxis-inner{bottom:48px}
+.analytics-chart.rotate-labels .analytics-bars{padding-bottom:48px}
+.analytics-chart.rotate-labels .analytics-gridlines{bottom:48px}
+.analytics-chart.rotate-labels .analytics-bar-label{
+  transform:rotate(-45deg);transform-origin:top right;text-align:right;
+  padding-right:4px;margin-top:4px
+}
+.analytics-top-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 4px;border-bottom:1px solid #f1f5f9}
+.analytics-top-row:last-child{border-bottom:none}
+.analytics-top-name{font-size:13px;color:#0f172a;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.analytics-top-meta{font-size:11px;color:var(--muted);margin-top:2px}
+.analytics-top-count{font-size:18px;font-weight:800;color:#dc2626;font-variant-numeric:tabular-nums}
+.analytics-top-actions{display:flex;align-items:center;gap:12px;flex-wrap:wrap;justify-content:flex-end}
+.analytics-pager-inline{display:flex;align-items:center;gap:4px;flex-wrap:wrap;justify-content:flex-end}
+.alerts-pager{display:flex;align-items:center;gap:4px;flex-wrap:wrap;justify-content:center;padding:12px 0 4px}
+.alerts-pager:empty{display:none}
+.alerts-pager .pager-info{font-size:12px;color:var(--muted);margin-right:10px}
+.analytics-top-row.clickable{cursor:pointer;transition:background .12s ease}
+.analytics-top-row.clickable:hover{background:#f8fafc}
+.analytics-filter-chip{
+  display:inline-flex;align-items:center;gap:6px;margin-top:4px;padding:3px 4px 3px 10px;
+  border-radius:999px;background:#eff6ff;border:1px solid #dbeafe;color:#1e3a8a;
+  font-size:11px;font-weight:600;line-height:1.5;width:fit-content
+}
+.analytics-filter-chip[hidden]{display:none}
+.analytics-filter-chip-x{
+  border:none;background:transparent;cursor:pointer;color:#1e3a8a;font-size:13px;
+  width:18px;height:18px;border-radius:999px;display:inline-flex;align-items:center;justify-content:center;padding:0
+}
+.analytics-filter-chip-x:hover{background:rgba(30,58,138,.1)}
+.analytics-pgnum{
+  min-width:28px;height:28px;padding:0 8px;border-radius:8px;border:1px solid var(--line);
+  background:#fff;font:inherit;font-size:12px;font-weight:600;color:#0f172a;cursor:pointer;
+  font-variant-numeric:tabular-nums;
+  display:inline-flex;align-items:center;justify-content:center;
+  transition:background .12s ease, border-color .12s ease, color .12s ease
+}
+.analytics-pgnum:hover{background:#f1f5f9;border-color:#cbd5e1}
+.analytics-pgnum.is-active{background:#dc2626;border-color:#dc2626;color:#fff;cursor:default}
+.analytics-pgnum.gap{border:none;background:transparent;cursor:default;color:var(--muted-2);min-width:18px;padding:0 2px}
+.summary-card{
+  border:1px solid var(--line);border-radius:16px;padding:16px;background:#fbfdff;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.5)
+}
+.summary-card.green{background:linear-gradient(180deg,#f8fffb,#f0fdf4)}
+.summary-card.amber{background:linear-gradient(180deg,#fffaf2,#fff7ed)}
+.summary-card.red{background:linear-gradient(180deg,#fff7f7,#fef2f2)}
+.summary-top{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}
+.summary-name{font-size:15px;font-weight:700;color:#111827}
+.summary-meta{font-size:12px;color:var(--muted);margin-top:4px}
+.summary-pill{
+  display:inline-flex;align-items:center;justify-content:center;padding:5px 10px;border-radius:999px;
+  font-size:12px;font-weight:700
+}
+.summary-pill.green{background:var(--green-soft);color:var(--green)}
+.summary-pill.amber{background:var(--amber-soft);color:var(--amber)}
+.summary-pill.red{background:var(--red-soft);color:var(--red)}
+.summary-split{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:14px 0 12px}
+.summary-k{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted-2);margin-bottom:6px}
+.summary-v{font-size:28px;font-weight:800;line-height:1;font-variant-numeric:tabular-nums;color:#0f172a}
+.summary-note{font-size:12px;color:var(--muted);margin-top:10px}
+
+.content-grid{display:grid;grid-template-columns:1.6fr 1fr;gap:16px;margin-top:18px}
+.panel{
+  background:var(--panel);border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow);overflow:hidden
+}
+.panel-head{
+  padding:14px 18px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;gap:12px
+}
+.panel-title{font-size:15px;font-weight:700;color:#111827}
+.panel-sub{font-size:12px;color:var(--muted)}
+.panel-body{padding:18px}
+.panel-body.scroll{max-height:560px;overflow:auto}
+
+/* Floor-plan view for the Overview "Threshold vs Actual" panel.
+   Container is sized by the image's 1561:429 aspect ratio so overlays
+   plotted in % coordinates land in the right spot across all viewports. */
+.zone-map{
+  position:relative;width:100%;aspect-ratio:1561/429;
+  background-image:url(/static/zone_map.png);
+  background-size:contain;background-repeat:no-repeat;background-position:top left;
+  background-color:#f1f5f9;border:1px solid var(--line);border-radius:12px
+}
+.zone-overlay{
+  position:absolute;transform:translate(-50%,-50%);
+  background:rgba(255,255,255,.95);border:2px solid #cbd5e1;border-radius:10px;
+  padding:5px 8px;min-width:78px;text-align:center;
+  box-shadow:0 4px 12px rgba(15,23,42,.16);font-variant-numeric:tabular-nums
+}
+.zone-overlay.green{border-color:#16a34a;background:#ecfdf5}
+.zone-overlay.amber{border-color:#d97706;background:#fff7ed}
+.zone-overlay.red{border-color:#dc2626;background:#fef2f2}
+.zone-overlay.muted{
+  border-color:#cbd5e1;background:rgba(248,250,252,.9);
+  border-style:dashed;opacity:.7
+}
+.zone-overlay.muted .zo-name{color:#64748b}
+.zo-count.zo-na{color:#94a3b8;font-weight:600}
+.zo-name{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#64748b;line-height:1}
+.zone-overlay.green .zo-name{color:#15803d}
+.zone-overlay.amber .zo-name{color:#b45309}
+.zone-overlay.red .zo-name{color:#b91c1c}
+.zo-count{font-size:14px;font-weight:800;color:#0f172a;margin-top:2px;line-height:1.1}
+.zo-count .zo-max{color:#64748b;font-weight:600;font-size:11px}
+.zo-bar{height:4px;border-radius:2px;background:#e5e7eb;margin-top:4px;overflow:hidden}
+.zo-bar > div{height:100%;background:#94a3b8;transition:width .3s ease}
+.zone-overlay.green .zo-bar > div{background:#16a34a}
+.zone-overlay.amber .zo-bar > div{background:#d97706}
+.zone-overlay.red .zo-bar > div{background:#dc2626}
+@media(max-width:700px){
+  .zone-overlay{min-width:54px;padding:3px 5px}
+  .zo-name{font-size:8px}
+  .zo-count{font-size:11px}
+  .zo-count .zo-max{font-size:9px}
+}
+#page-alerts .panel-body.scroll{max-height:calc(100vh - 200px);min-height:520px}
+
+.status-chip{
+  display:inline-flex;align-items:center;gap:7px;font-size:12px;font-weight:600;padding:5px 10px;border-radius:999px
+}
+.status-chip .dot{width:8px;height:8px;border-radius:999px;background:currentColor}
+.status-chip.online{background:var(--green-soft);color:var(--green)}
+.status-chip.offline{background:#f8fafc;color:var(--muted)}
+.status-chip.error{background:var(--red-soft);color:var(--red)}
+.status-chip.warning{background:var(--amber-soft);color:var(--amber)}
+
+.zone-list{display:grid;gap:12px}
+.zone-card{
+  border:1px solid var(--line);border-radius:14px;padding:14px;background:#fbfdff
+}
+.zone-top{display:flex;align-items:start;justify-content:space-between;gap:14px}
+.zone-name{font-size:15px;font-weight:700;color:#111827}
+.zone-meta{font-size:12px;color:var(--muted);margin-top:4px}
+.zone-count{font-size:28px;font-weight:800;line-height:1;font-variant-numeric:tabular-nums}
+.zone-limit{font-size:12px;color:var(--muted);margin-top:4px;text-align:right}
+.progress{height:8px;border-radius:999px;background:#e2e8f0;overflow:hidden;margin-top:12px}
+.progress-bar{height:100%;border-radius:999px;transition:width .2s ease}
+.progress-bar.green{background:#22c55e}
+.progress-bar.amber{background:#f59e0b}
+.progress-bar.red{background:#ef4444}
+.chip-row{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}
+.mini-chip{
+  background:#eff6ff;color:#1d4ed8;border-radius:999px;padding:3px 8px;font-size:11px;font-weight:600
+}
+
+.alert-list{display:grid;gap:10px}
+.alert-item{
+  display:flex;align-items:flex-start;gap:12px;border:1px solid var(--line);border-left:4px solid #cbd5e1;
+  border-radius:12px;padding:12px 14px;background:#fff;transition:opacity .15s ease
+}
+.alert-item.critical{border-left-color:#dc2626;background:linear-gradient(180deg,#fff7f7,#fff)}
+.alert-item.warning{border-left-color:#d97706;background:linear-gradient(180deg,#fffaf2,#fff)}
+.alert-item.acknowledged{opacity:.55;background:#fff}
+.alert-item.acknowledged.critical,.alert-item.acknowledged.warning{border-left-color:#cbd5e1;background:#fafbfc}
+.alert-badge{
+  padding:4px 8px;border-radius:6px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;flex-shrink:0
+}
+.alert-badge.critical{background:var(--red-soft);color:var(--red)}
+.alert-badge.warning{background:var(--amber-soft);color:var(--amber)}
+.alert-msg-row{display:flex;align-items:flex-start;gap:10px}
+.alert-msg{flex:1;min-width:0;font-size:13px;color:#1f2937;line-height:1.45}
+.alert-meta{font-size:11px;color:var(--muted);margin-top:6px;display:flex;flex-wrap:wrap;align-items:center;gap:8px}
+.alert-chip{
+  display:inline-flex;align-items:center;gap:4px;padding:2px 7px;border-radius:6px;
+  background:#f1f5f9;color:#475569;font-weight:600;font-size:11px;border:1px solid #e2e8f0
+}
+.alert-chip.zone{color:#1e3a8a;background:#eff6ff;border-color:#dbeafe}
+.alert-chip.vehicle{color:#9a3412;background:#fff7ed;border-color:#fed7aa}
+.alert-img-btn, .alert-ack-btn{
+  flex-shrink:0;display:inline-flex;align-items:center;justify-content:center;
+  height:30px;padding:0 12px;border-radius:8px;border:1px solid var(--line);
+  background:#fff;color:#475569;text-decoration:none;
+  cursor:pointer;line-height:1;font-size:12px;font-weight:600;white-space:nowrap;
+  transition:transform .12s ease, background .12s ease, border-color .12s ease, color .12s ease
+}
+.alert-img-btn:hover{background:#f1f5f9;border-color:#cbd5e1;color:#1e293b;transform:scale(1.03)}
+.alert-ack-btn:hover{background:#dcfce7;border-color:#86efac;color:#15803d;transform:scale(1.03)}
+.alert-ack-btn:disabled{opacity:.45;cursor:default;transform:none}
+.alert-time{font-variant-numeric:tabular-nums;color:var(--muted)}
+.alert-ack-state{color:#16a34a;font-weight:600}
+
+.alerts-stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:16px}
+.alerts-stat{
+  background:var(--panel);border:1px solid var(--line);border-left:4px solid #cbd5e1;border-radius:12px;
+  padding:14px 16px;display:flex;flex-direction:column;gap:4px
+}
+.alerts-stat.red{border-left-color:#dc2626}
+.alerts-stat.amber{border-left-color:#d97706}
+.alerts-stat.green{border-left-color:#16a34a}
+.alerts-stat.slate{border-left-color:#475569}
+.alerts-stat-label{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted-2);font-weight:700}
+.alerts-stat-value{font-size:26px;font-weight:800;color:#0f172a;font-variant-numeric:tabular-nums;line-height:1}
+.alerts-stat-value.red{color:#dc2626}
+.alerts-stat-value.amber{color:#d97706}
+.alerts-stat-value.green{color:#16a34a}
+
+.alerts-panel{overflow:visible}
+.alerts-toolbar{
+  padding:12px 16px;border-bottom:1px solid var(--line);
+  display:flex;flex-wrap:wrap;gap:10px;align-items:center
+}
+.alerts-search-input{
+  flex:1 1 220px;min-width:180px;padding:7px 12px;border:1px solid var(--line);border-radius:8px;
+  font:inherit;font-size:13px;color:#0f172a;background:#fff
+}
+.alerts-search-input:focus{outline:none;border-color:#2563eb;box-shadow:0 0 0 3px rgba(37,99,235,.12)}
+.alerts-select{padding:7px 28px 7px 10px;border:1px solid var(--line);border-radius:8px;font:inherit;font-size:13px;background:#fff;color:#0f172a;cursor:pointer}
+.btn.danger{background:#fff;color:#dc2626;border-color:#fecaca}
+.btn.danger:not([disabled]):hover{background:#fef2f2}
+.btn[disabled]{opacity:.45;cursor:default}
+
+.table-wrap{background:var(--panel);border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow);overflow:hidden}
+table{width:100%;border-collapse:collapse}
+thead th{
+  background:#f8fafc;border-bottom:1px solid var(--line);padding:13px 16px;text-align:left;
+  font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted-2)
+}
+tbody td{
+  padding:14px 16px;border-bottom:1px solid var(--line);font-size:14px;color:#334155;vertical-align:middle
+}
+tbody tr:hover{background:#fafcff}
+tbody tr:last-child td{border-bottom:none}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+.truncate{max-width:320px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.empty{padding:42px 20px;text-align:center;color:var(--muted);font-size:14px}
+
+.live-layout{display:grid;grid-template-columns:minmax(0,1fr) 220px;gap:14px;align-items:start}
+.live-stage{display:grid;gap:14px;width:100%;min-width:0}
+.live-side{display:grid;gap:10px}
+.live-side .panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);overflow:hidden}
+.live-side .panel-head{padding:8px 12px;border-bottom:1px solid var(--line);font-size:10px;font-weight:700;letter-spacing:.06em;color:var(--muted);text-transform:uppercase;background:#f9fafb}
+.live-side .panel-body{padding:4px 12px 6px}
+.live-side .ls-row{display:flex;align-items:center;justify-content:space-between;padding:5px 0;border-bottom:1px dashed var(--line)}
+.live-side .ls-row:last-child{border-bottom:0}
+.live-side .ls-label{font-size:11px;color:var(--muted)}
+.live-side .ls-value{font-size:12px;color:var(--text);font-weight:600;text-align:right;max-width:60%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.live-side .ls-value.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
+.live-side .ls-value.ok{color:#15803d}
+.live-side .ls-value.warn{color:#b45309}
+.live-side .ls-value.danger{color:#b91c1c}
+.live-side .ls-value.muted{color:var(--muted);font-weight:500}
+.live-toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.live-toolbar label{font-size:13px;color:var(--muted);font-weight:600}
+.live-select{
+  min-width:240px;border:1px solid var(--line-2);background:#fff;color:var(--text);
+  padding:9px 12px;border-radius:10px;font-family:inherit;font-size:14px
+}
+.live-select:focus{outline:none;border-color:#93c5fd;box-shadow:0 0 0 3px rgba(37,99,235,.12)}
+.stream-card{
+  background:var(--panel);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;width:100%
+}
+.stream-head{display:flex;align-items:center;justify-content:space-between;padding:14px 18px;border-bottom:1px solid var(--line)}
+.stream-title{font-size:15px;font-weight:700;color:#111827}
+.stream-meta{font-size:12px;color:var(--muted)}
+.stream-frame{
+  background:#0f172a center center / contain no-repeat;
+  aspect-ratio:16/8.2;position:relative
+}
+.stream-media{position:absolute;inset:0}
+.stream-frame img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;display:block}
+.stream-snapshot{z-index:1;transition:opacity .18s ease}
+.stream-live{z-index:2;opacity:0;transition:opacity .18s ease}
+.stream-loading{
+  position:absolute;inset:0;display:flex;align-items:center;justify-content:center;z-index:3;
+  color:#e2e8f0;font-size:14px;font-weight:600;background:linear-gradient(180deg,rgba(15,23,42,.12),rgba(15,23,42,.34));
+  text-align:center;padding:24px;pointer-events:none
+}
+.stream-loading.hidden{display:none}
+.stream-empty{
+  position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;
+  color:#cbd5e1;font-size:14px;padding:24px;line-height:1.5;background:rgba(15,23,42,.55);z-index:4
+}
+.alerts-toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.check-inline{display:inline-flex;align-items:center;gap:8px;font-size:13px;color:var(--muted);font-weight:600}
+.check-inline input{accent-color:#2563eb}
+
+.feed-shell{display:grid;gap:16px}
+.feed-stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}
+.feed-stat{
+  background:#1e293b;border:1px solid #263548;border-radius:16px;padding:16px 18px;
+  color:#fff;box-shadow:0 14px 30px rgba(15,23,42,.12)
+}
+.feed-stat-label{font-size:12px;color:#94a3b8;margin-bottom:8px}
+.feed-stat-value{font-size:34px;line-height:1;font-weight:800;font-variant-numeric:tabular-nums}
+.feed-toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.feed-btn{
+  display:inline-flex;align-items:center;gap:8px;padding:9px 14px;border-radius:10px;border:1px solid #263548;
+  background:#1e293b;color:#e2e8f0;cursor:pointer;font-size:13px;font-weight:700;transition:.15s ease
+}
+.feed-btn:hover{background:#243447;border-color:#334155}
+.feed-btn.pause{background:#d97706;border-color:#d97706;color:#fff}
+.feed-btn.resume{background:#16a34a;border-color:#16a34a;color:#fff}
+.feed-filter{
+  flex:1;min-width:260px;border:1px solid #263548;background:#1e293b;color:#e2e8f0;
+  padding:10px 12px;border-radius:10px;font-family:inherit;font-size:13px
+}
+.feed-filter::placeholder{color:#64748b}
+.feed-filter:focus{outline:none;border-color:#60a5fa;box-shadow:0 0 0 3px rgba(37,99,235,.12)}
+.feed-layout{display:grid;grid-template-columns:minmax(0,1.7fr) 400px;gap:14px;min-height:560px}
+.feed-pane{
+  background:#111827;border:1px solid #1f2937;border-radius:16px;overflow:hidden;
+  box-shadow:0 14px 30px rgba(15,23,42,.08)
+}
+.feed-pane-head{
+  padding:12px 14px;border-bottom:1px solid #1f2937;background:#1e293b;color:#cbd5e1;
+  font-size:13px;font-weight:700
+}
+.feed-table-head,.feed-row{
+  display:grid;grid-template-columns:110px 140px 150px 90px minmax(0,1fr);gap:12px;align-items:center
+}
+.feed-table-head{
+  padding:12px 14px;border-bottom:1px solid #1f2937;background:#1e293b;color:#94a3b8;
+  font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase
+}
+.feed-list{max-height:560px;overflow:auto}
+.feed-row{
+  padding:10px 14px;border-bottom:1px solid #1f2937;color:#cbd5e1;font-size:12px;cursor:pointer;
+  transition:background .15s ease
+}
+.feed-row:hover{background:#172235}
+.feed-row.active{background:rgba(37,99,235,.16)}
+.feed-cell-muted{color:#64748b}
+.feed-cell-mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.feed-type{
+  display:inline-flex;align-items:center;justify-content:center;padding:3px 8px;border-radius:999px;
+  font-size:10px;font-weight:700;letter-spacing:.04em;text-transform:lowercase
+}
+.feed-type.default{background:rgba(148,163,184,.18);color:#cbd5e1}
+.feed-type.overview{background:rgba(34,197,94,.16);color:#4ade80}
+.feed-type.zone{background:rgba(59,130,246,.16);color:#60a5fa}
+.feed-type.alert{background:rgba(248,113,113,.16);color:#fca5a5}
+.feed-type.system{background:rgba(14,165,233,.16);color:#67e8f9}
+.feed-type.muted{background:rgba(100,116,139,.16);color:#94a3b8}
+.feed-cell-truncate{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.feed-detail-body{padding:16px;max-height:604px;overflow:auto;background:#111827}
+.feed-meta-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px}
+.feed-meta-label{font-size:11px;color:#64748b;margin-bottom:4px;text-transform:uppercase;letter-spacing:.08em}
+.feed-meta-value{color:#e2e8f0;font-size:13px;font-weight:600}
+.feed-json{
+  background:#020617;border:1px solid #1f2937;border-radius:12px;padding:12px;
+  color:#93c5fd;font-size:11px;line-height:1.55;white-space:pre-wrap;word-break:break-word;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace
+}
+.feed-empty{
+  min-height:220px;display:flex;align-items:center;justify-content:center;text-align:center;
+  padding:24px;color:#64748b;font-size:14px
+}
+
+.inspector{display:grid;gap:16px}
+.info-card{
+  background:var(--panel);border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow);padding:16px
+}
+.info-title{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted-2);margin-bottom:12px;font-weight:700}
+.kv{display:grid;gap:10px}
+.kv-row{display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:13px}
+.kv-row span:first-child{color:var(--muted)}
+.kv-row span:last-child{font-weight:600;color:#0f172a}
+.edge-stack{display:grid;gap:16px}
+.edge-card{
+  background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:18px;box-shadow:var(--shadow)
+}
+.edge-card-head{
+  display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:14px
+}
+.edge-card-title{display:flex;align-items:center;gap:10px}
+.edge-card-icon{
+  width:28px;height:28px;border-radius:999px;background:var(--green-soft);color:var(--green);
+  display:grid;place-items:center;font-size:13px;font-weight:700;flex-shrink:0
+}
+.edge-card-name{font-size:16px;font-weight:700;color:#111827}
+.edge-card-sub{font-size:12px;color:var(--muted);margin-top:4px}
+.edge-resource-panel{
+  background:#f8fafc;border:1px solid #edf2f7;border-radius:16px;padding:16px
+}
+.edge-resource-title{
+  font-size:13px;font-weight:700;color:#334155;margin-bottom:14px;display:flex;align-items:center;gap:8px
+}
+.edge-util-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px 24px}
+.edge-util{display:grid;gap:6px}
+.edge-util-top{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.edge-util-label{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:600;color:#334155}
+.edge-util-label i{font-style:normal;color:#94a3b8}
+.edge-util-value{font-size:13px;font-weight:700;color:#475569;font-variant-numeric:tabular-nums}
+.edge-util-track{height:11px;background:#e2e8f0;border-radius:999px;overflow:hidden}
+.edge-util-fill{height:100%;border-radius:999px;transition:width .2s ease}
+.edge-util-fill.blue{background:#3b82f6}
+.edge-util-fill.purple{background:#a855f7}
+.edge-util-fill.cyan{background:#06b6d4}
+.edge-util-fill.amber{background:#f59e0b}
+.edge-util-fill.slate{background:#64748b}
+.edge-util-note{
+  font-size:11px;color:#94a3b8;font-family:ui-monospace,SFMono-Regular,Menlo,monospace
+}
+.edge-mini-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px;margin-top:16px}
+.edge-mini-card{
+  background:#f8fafc;border:1px solid #edf2f7;border-radius:14px;padding:14px 12px;text-align:center
+}
+.edge-mini-icon{font-size:14px;color:#94a3b8;margin-bottom:8px}
+.edge-mini-value{
+  font-size:30px;line-height:1;font-weight:800;color:#0f172a;font-variant-numeric:tabular-nums
+}
+.edge-mini-value.compact{font-size:24px}
+.edge-mini-label{margin-top:8px;font-size:12px;color:var(--muted)}
+.edge-inline-note{margin-top:12px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;color:var(--muted)}
+.edge-inline-note strong{color:#334155}
+.edge-error-chip{
+  display:inline-flex;align-items:center;padding:4px 8px;border-radius:999px;
+  background:var(--red-soft);color:var(--red);font-size:11px;font-weight:700
+}
+
+.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.form-group{margin-bottom:14px}
+.form-group label{display:block;font-size:12px;color:var(--muted);margin-bottom:6px;font-weight:600}
+.form-group input,.form-group select,.form-group textarea{
+  width:100%;border:1px solid var(--line-2);background:#f8fafc;color:var(--text);
+  padding:10px 12px;border-radius:12px;font-family:inherit;font-size:14px
+}
+.form-group textarea{resize:vertical}
+.form-group input:focus,.form-group select:focus,.form-group textarea:focus{
+  outline:none;border-color:#93c5fd;box-shadow:0 0 0 3px rgba(37,99,235,.12)
+}
+
+.modal-bg{
+  position:fixed;inset:0;background:rgba(15,23,42,.48);display:none;align-items:center;justify-content:center;
+  z-index:100;padding:24px
+}
+.modal-bg.show{display:flex}
+.modal{
+  width:min(520px,100%);max-height:92vh;overflow:auto;background:var(--panel);
+  border:1px solid var(--line);border-radius:20px;box-shadow:0 24px 80px rgba(15,23,42,.18);padding:22px
+}
+.modal.wide{width:min(1100px,100%)}
+.modal h3{font-size:18px;font-weight:700;color:#111827;margin-bottom:16px}
+
+.zone-editor{display:grid;grid-template-columns:340px 1fr;gap:18px;align-items:start}
+.zone-canvas-wrap{background:#f8fafc;border:1px solid var(--line);border-radius:16px;padding:14px}
+.zone-mobile-notice{
+  display:none;background:#fff7ed;border:1px solid #fdba74;border-radius:12px;
+  padding:14px 16px;color:#9a3412;font-size:13px;line-height:1.45
+}
+.zone-mobile-notice strong{display:block;margin-bottom:4px;color:#7c2d12;font-size:14px}
+.zone-tools{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+.zone-help,.poly-status{font-size:12px;color:var(--muted);line-height:1.55}
+.poly-status{margin-top:10px}
+.zone-canvas{
+  display:block;width:100%;max-width:800px;aspect-ratio:8/5;border-radius:12px;background:#e2e8f0;cursor:crosshair
+}
+
+@media(max-width:1180px){
+  .metrics{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .feed-stats{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .feed-layout{grid-template-columns:1fr}
+  .edge-mini-grid{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .content-grid,.live-layout{grid-template-columns:1fr}
+  .analytics-grid{grid-template-columns:1fr}
+}
+@media(max-width:900px){
+  .sidebar{width:76px}
+  .nav-section,.nav a span{display:none}
+  .brand{padding:0 4px;height:64px}
+  .brand-logo{height:48px}
+  .nav a{justify-content:center;padding:12px}
+  .content{padding:16px}
+  .metrics{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .feed-stats{grid-template-columns:1fr}
+  .edge-util-grid,.edge-mini-grid{grid-template-columns:1fr}
+  .form-grid,.zone-editor{grid-template-columns:1fr}
+  .header{padding:0 16px}
+  .header-title{font-size:16px}
+  .occupancy-strip{flex-direction:column}
+}
+
+/* ============================================================
+   Mobile (<=700px): hamburger + off-canvas sidebar, single-col
+   ============================================================ */
+.menu-btn{display:none}
+.scrim-sidebar{
+  display:none;position:fixed;inset:0;background:rgba(15,23,42,.4);
+  z-index:55;opacity:0;visibility:hidden;
+  transition:opacity .22s ease, visibility .22s ease
+}
+@media(max-width:700px){
+  /* Hamburger toggle */
+  .menu-btn{
+    display:inline-flex;align-items:center;justify-content:center;
+    width:38px;height:38px;border-radius:10px;
+    background:#fff;border:1px solid var(--line);
+    cursor:pointer;color:#0f172a;font-size:20px;line-height:1;
+    flex-shrink:0
+  }
+  .menu-btn:active{background:#f1f5f9}
+  /* Off-canvas sidebar (slides in from left) */
+  .sidebar{
+    position:fixed;top:0;left:0;height:100vh;width:240px;
+    z-index:60;transform:translateX(-100%);
+    transition:transform .22s ease;
+    box-shadow:8px 0 24px rgba(15,23,42,.12)
+  }
+  .sidebar.open{transform:translateX(0)}
+  /* Restore labels inside the off-canvas (override 900px icon-only) */
+  .nav-section,.nav a span{display:inline}
+  .brand{padding:0 16px;height:80px}
+  .brand-logo{height:64px}
+  .nav a{justify-content:flex-start;padding:11px 14px;font-size:14px}
+  /* Backdrop while open */
+  .scrim-sidebar{display:block}
+  .scrim-sidebar.open{opacity:1;visibility:visible}
+  /* Header tighter */
+  .header{padding:0 12px;gap:10px}
+  .header-title{
+    font-size:14px;flex:1;min-width:0;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap
+  }
+  .header-meta{gap:8px;margin-left:0}
+  #top-clock{display:none}
+  .ws-state span:last-child{display:none}
+  .bell-btn{width:34px;height:34px}
+  /* Content */
+  .content{padding:12px}
+  .page-head{flex-direction:column;align-items:stretch;gap:10px}
+  .page-title{font-size:17px}
+  /* Single-column grids */
+  .metrics{grid-template-columns:1fr}
+  .content-grid,.live-layout,.feed-stats,.feed-layout,
+  .edge-util-grid,.edge-mini-grid,.analytics-grid,
+  .form-grid,.zone-editor{grid-template-columns:1fr}
+  /* Tables get a horizontal scroll instead of squashing */
+  .table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
+  .table-wrap table{min-width:540px}
+  /* Filter / search bars stack */
+  .filter-bar{flex-direction:column;align-items:stretch}
+  .filter-bar > *{width:100%;min-width:0;max-width:none}
+  /* Live View dropdown full-width too */
+  .live-toolbar{flex-direction:column;align-items:stretch}
+  .live-select{width:100%;min-width:0}
+  /* Drawer fullscreen */
+  .drawer{width:100%;max-width:100%}
+  /* Toasts: full-width strip across the top, below the page-head
+     toolbar (which stacks vertically on phones and can be ~120px tall). */
+  .toast-stack{right:8px;left:8px;top:140px;bottom:auto}
+  .toast{width:auto;max-width:none}
+  /* Don't aggressively truncate alert messages */
+  .truncate{max-width:none;white-space:normal}
+  /* Modal: near-fullscreen */
+  .modal{width:96vw;max-height:92vh;overflow-y:auto}
+  .modal.wide{width:96vw}
+  /* Live View image fits viewport */
+  #live-canvas{max-width:100%}
+  /* iOS Safari auto-zooms any form field whose font-size is <16px.
+     Lifting all inputs/selects/textareas to 16px on phones prevents the
+     viewport from snapping in every time the user taps a search box or
+     dropdown — the single biggest "feels broken on iPhone" fix. */
+  input,select,textarea{font-size:16px}
+  /* Mobile users get the operator surface only — Cameras / Zones /
+     Edge Status / Data Feed are admin-only and hidden from the nav.
+     The pages still exist on the desktop sidebar and remain reachable
+     by direct URL for anyone debugging on the road. */
+  #nav-cameras,#nav-zones,#nav-edge,#nav-feed,#nav-config-header{display:none}
+  /* Alerts toolbar densification: the desktop has 7 controls that fall
+     into a 4–5 row ladder on phones. Hide search (typing on mobile is
+     painful, filters cover most needs) and the per-page selector (50/page
+     is a fine mobile default). Float the Ack-All button to its own row
+     so it's a clear full-width action. */
+  #alerts-search,
+  label[for="alerts-per-page"]{display:none}
+  #alerts-ack-all-btn{width:100%}
+  /* Ramp Occupancy Map: keep the floor-plan view on mobile but give
+     it a comfortable min-width so the zone labels stay legible. The
+     containing panel-body scrolls horizontally, so the operator
+     pans left/right with their thumb to inspect the whole ramp. */
+  .zone-map{min-width:1000px}
+  .panel-body:has(> .zone-map){overflow-x:auto;-webkit-overflow-scrolling:touch}
+  /* Bump label / count font slightly so a panned tile is readable
+     even when only ~half the map is in view. */
+  .zone-map .zo-name{font-size:11px}
+  .zone-map .zo-count{font-size:15px}
+  /* Analytics chart: same problem as the ramp map — at 360px viewport,
+     hourly/daily bars get squashed and the rotated labels overlap.
+     Give the chart a min-width and let the containing panel-body
+     scroll horizontally, so the operator pans through the time range
+     instead of staring at unreadable overlap. */
+  .analytics-chart{min-width:720px}
+  .panel-body:has(> .analytics-chart){overflow-x:auto;-webkit-overflow-scrolling:touch}
+  /* Zone polygon editor isn't usable on a phone — the canvas is fixed
+     800×500 with mouse-coord drawing. Hide the canvas + drawing
+     controls and replace with a notice. Existing metadata fields
+     (name, capacity, ramp side, etc.) remain editable below. */
+  .zone-canvas-wrap{display:none}
+  .zone-mobile-notice{display:block}
+}
+
+@media(max-width:480px){
+  .content{padding:10px}
+  .header{padding:0 10px;gap:8px}
+  .header-title{font-size:13px}
+  .page-title{font-size:16px}
+  .page-sub{font-size:12px}
+  .metric-value{font-size:24px}
+  /* Touch-friendly buttons */
+  .btn{min-height:40px;padding:9px 14px}
+  .table-wrap table{min-width:480px}
+}
+
+/* Viewer mode (non-localhost clients): hide Configuration entirely.
+   Admin pages stay registered server-side but are unreachable from
+   the sidebar; direct hash navigation is also blocked in JS. */
+body.viewer-mode #nav-config-header,
+body.viewer-mode #nav-cameras,
+body.viewer-mode #nav-zones,
+body.viewer-mode #nav-edge,
+body.viewer-mode #nav-feed{display:none !important}
+</style>
+</head>
+<body>
+<div class="app-shell">
+  <div class="scrim-sidebar" id="sidebar-scrim" onclick="closeSidebar()"></div>
+  <aside class="sidebar">
+    <div class="brand">
+      <img src="/static/gmr-logo.webp" alt="GMR" class="brand-logo">
+    </div>
+
+    <nav class="nav">
+      <div class="nav-section">Operations</div>
+      <a href="#overview" onclick="return navigateToPage('overview')" class="active" id="nav-overview"><span class="nav-ic">▦</span><span>Overview</span></a>
+      <a href="#live" onclick="return navigateToPage('live')" id="nav-live"><span class="nav-ic">◫</span><span>Live View</span></a>
+      <a href="#feed" onclick="return navigateToPage('feed')" id="nav-feed"><span class="nav-ic">⌁</span><span>Data Feed</span></a>
+      <a href="#alerts" onclick="return navigateToPage('alerts')" id="nav-alerts"><span class="nav-ic">△</span><span>Alerts</span></a>
+      <a href="#analytics" onclick="return navigateToPage('analytics')" id="nav-analytics"><span class="nav-ic">▤</span><span>Analytics</span></a>
+
+      <div class="nav-section" id="nav-config-header" style="margin-top:14px">Configuration</div>
+      <a href="#cameras" onclick="return navigateToPage('cameras')" id="nav-cameras"><span class="nav-ic">◉</span><span>Cameras</span></a>
+      <a href="#zones" onclick="return navigateToPage('zones')" id="nav-zones"><span class="nav-ic">⌘</span><span>Zones</span></a>
+      <a href="#edge" onclick="return navigateToPage('edge')" id="nav-edge"><span class="nav-ic">▣</span><span>Edge Status</span></a>
+    </nav>
+
+  </aside>
+
+  <div class="workspace">
+    <header class="header">
+      <button class="menu-btn" type="button" onclick="toggleSidebar()" aria-label="Menu">☰</button>
+      <div class="header-title">Airport Arrival Ramp Monitoring</div>
+      <div class="header-meta">
+        <div class="ws-state" id="ws-badge"><span class="live-dot"></span><span>Connecting</span></div>
+        <div class="clock" id="top-clock"></div>
+        <button class="bell-btn" id="bell-btn" type="button" onclick="toggleAlertDrawer()" aria-label="Notifications" title="Notifications">
+          <span class="bell-icon" aria-hidden="true">🔔</span>
+          <span class="bell-badge" id="bell-badge" hidden>0</span>
+        </button>
+      </div>
+    </header>
+
+    <main class="content">
+      <section class="page active" id="page-overview">
+        <div class="page-head">
+          <div>
+            <div class="page-title">Overview</div>
+            <div class="page-sub">Live vehicle occupancy, dwell pressure, and recent ramp alerts.</div>
+          </div>
+          <button class="btn" onclick="fetchAll()">Refresh</button>
+        </div>
+
+        <div class="metrics" id="stat-cards"></div>
+
+
+        <div class="panel summary-panel">
+          <div class="panel-head">
+            <div>
+              <div class="panel-title">Ramp Occupancy Map</div>
+              <div class="panel-sub" id="overview-summary-sub">Live vehicle counts overlaid on the arrival ramp floor plan.</div>
+            </div>
+          </div>
+          <div class="panel-body">
+            <div class="zone-map" id="overview-summary"><div class="empty">No zones yet</div></div>
+          </div>
+        </div>
+
+      </section>
+
+      <section class="page" id="page-live">
+        <div class="page-head">
+          <div>
+            <div class="page-title">Live View</div>
+            <div class="page-sub">Annotated streams, edge-side overlays, and per-camera health.</div>
+          </div>
+          <div class="live-toolbar">
+            <label for="live-camera-select">Camera</label>
+            <select id="live-camera-select" class="live-select" onchange="onLiveCameraChange()">
+              <option value="">Loading cameras...</option>
+            </select>
+          </div>
+        </div>
+        <div class="live-layout">
+          <div class="live-stage" id="live-feeds"><div class="empty">Add cameras on the Cameras page to view annotated streams.</div></div>
+          <aside class="live-side" id="live-side">
+            <div class="panel">
+              <div class="panel-head">Zones &amp; counts</div>
+              <div class="panel-body" id="live-side-zones">
+                <div class="ls-row"><span class="ls-value muted">Select a camera to see live counts.</span></div>
+              </div>
+            </div>
+          </aside>
+        </div>
+      </section>
+
+      <section class="page" id="page-feed">
+        <div class="page-head">
+          <div>
+            <div class="page-title">Live Data Feed</div>
+            <div class="page-sub">Edge-to-cloud MQTT messages flowing through the dashboard websocket.</div>
+          </div>
+        </div>
+        <div class="feed-shell">
+          <div class="feed-stats">
+            <div class="feed-stat">
+              <div class="feed-stat-label">Messages/sec</div>
+              <div class="feed-stat-value" id="feed-rate">0.0</div>
+            </div>
+            <div class="feed-stat">
+              <div class="feed-stat-label">Total Messages</div>
+              <div class="feed-stat-value" id="feed-total">0</div>
+            </div>
+            <div class="feed-stat">
+              <div class="feed-stat-label">Total Data</div>
+              <div class="feed-stat-value" id="feed-bytes">0 B</div>
+            </div>
+            <div class="feed-stat">
+              <div class="feed-stat-label">Avg Size</div>
+              <div class="feed-stat-value" id="feed-avg">0 B</div>
+            </div>
+          </div>
+
+          <div class="feed-toolbar">
+            <button class="feed-btn pause" id="feed-toggle" onclick="toggleFeedPause()">Pause</button>
+            <button class="feed-btn" onclick="clearFeed()">Clear</button>
+            <button class="feed-btn" onclick="exportFeed()">Export</button>
+            <input id="feed-filter" class="feed-filter" placeholder="Filter by type, topic, or content..." oninput="onFeedFilterChange()">
+          </div>
+
+          <div class="feed-layout">
+            <div class="feed-pane">
+              <div class="feed-table-head">
+                <div>Time</div>
+                <div>Type</div>
+                <div>Topic</div>
+                <div>Size</div>
+                <div>Preview</div>
+              </div>
+              <div class="feed-list" id="feed-list"><div class="feed-empty">Waiting for websocket traffic...</div></div>
+            </div>
+
+            <div class="feed-pane">
+              <div class="feed-pane-head">Message Detail</div>
+              <div class="feed-detail-body" id="feed-detail"><div class="feed-empty">Click a message to inspect</div></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="page" id="page-alerts">
+        <div class="page-head">
+          <div>
+            <div class="page-title">Alerts</div>
+            <div class="page-sub">Operational alert log across all active ramp zones.</div>
+          </div>
+          <button class="btn" onclick="fetchAlertsFull()">Refresh</button>
+        </div>
+
+        <div class="alerts-stats" id="alerts-stats"></div>
+
+        <div class="panel alerts-panel">
+          <div class="alerts-toolbar">
+            <input type="search" id="alerts-search" class="alerts-search-input" placeholder="Search message, zone, or vehicle id…" oninput="alertsPageIndex=0; renderAlertsFull()">
+            <select id="alert-filter" class="alerts-select" onchange="fetchAlertsFull()">
+              <option value="">All types</option>
+              <option value="overcrowding">Overcrowding</option>
+              <option value="overstay">Overstay</option>
+              <option value="camera_offline">Camera offline</option>
+            </select>
+            <select id="alert-severity-filter" class="alerts-select" onchange="alertsPageIndex=0; renderAlertsFull()">
+              <option value="">All severities</option>
+              <option value="critical">Critical only</option>
+              <option value="warning">Warning only</option>
+            </select>
+            <select id="alert-zone-filter" class="alerts-select" onchange="alertsPageIndex=0; renderAlertsFull()">
+              <option value="">All zones</option>
+            </select>
+            <label class="check-inline"><input type="checkbox" id="alert-unacked-only" checked onchange="fetchAlertsFull()">Unacknowledged only</label>
+            <label class="check-inline" for="alerts-per-page" style="gap:6px">Per page
+              <select id="alerts-per-page" class="alerts-select" onchange="onAlertsPerPageChange()" style="min-width:auto;width:auto">
+                <option value="10">10</option>
+                <option value="50" selected>50</option>
+                <option value="100">100</option>
+              </select>
+            </label>
+            <button class="btn danger" id="alerts-ack-all-btn" onclick="ackAllVisible()" disabled>Acknowledge all visible</button>
+          </div>
+          <div class="panel-body scroll">
+            <div class="alert-list" id="alerts-full"><div class="empty">Loading…</div></div>
+            <div class="alerts-pager" id="alerts-pager"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="page" id="page-analytics">
+        <div class="page-head">
+          <div>
+            <div class="page-title">Analytics</div>
+            <div class="page-sub">Recorded alert activity by hour or day. Use the range buttons to widen the window.</div>
+          </div>
+          <button class="btn" onclick="fetchAnalytics()">Refresh</button>
+        </div>
+
+        <div class="panel" style="margin-bottom:18px">
+          <div class="panel-body" style="padding:14px 18px">
+            <div class="analytics-toolbar">
+              <div class="analytics-toolgroup" role="group" aria-label="Range">
+                <span class="analytics-toolgroup-label">Range</span>
+                <div class="analytics-pillrow" id="analytics-range-row">
+                  <button type="button" class="analytics-pill" data-range="1h" onclick="setAnalyticsRange('1h')">Last hour</button>
+                  <button type="button" class="analytics-pill is-active" data-range="24h" onclick="setAnalyticsRange('24h')">Last 24h</button>
+                  <button type="button" class="analytics-pill" data-range="7d" onclick="setAnalyticsRange('7d')">Past 7 days</button>
+                  <button type="button" class="analytics-pill" data-range="30d" onclick="setAnalyticsRange('30d')">Past 30 days</button>
+                </div>
+              </div>
+              <div class="analytics-toolgroup" role="group" aria-label="Alert type">
+                <span class="analytics-toolgroup-label">Type</span>
+                <div class="analytics-pillrow" id="analytics-type-row">
+                  <button type="button" class="analytics-pill is-active" data-type="overcrowding" onclick="setAnalyticsType('overcrowding')">Zone capacity exceeding</button>
+                  <button type="button" class="analytics-pill" data-type="overstay" onclick="setAnalyticsType('overstay')">Vehicle overstay</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="analytics-grid">
+          <div class="panel">
+            <div class="panel-head">
+              <div>
+                <div class="panel-title" id="analytics-chart-title">Alert events</div>
+                <div class="analytics-filter-chip" id="analytics-filter-chip" hidden></div>
+              </div>
+              <div class="analytics-total" id="analytics-total">—</div>
+            </div>
+            <div class="panel-body">
+              <div class="analytics-chart" id="analytics-chart"><div class="empty">Loading…</div></div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head">
+              <div>
+                <div class="panel-title" id="analytics-top-title">Top zones</div>
+                <div class="panel-sub" id="analytics-top-sub">Highest alert volume in the selected window.</div>
+              </div>
+              <div class="analytics-top-actions">
+                <select id="analytics-zone-filter" class="analytics-select" onchange="setAnalyticsZoneFilter(this.value)" hidden></select>
+                <div class="analytics-pager-inline" id="analytics-top-pager"></div>
+              </div>
+            </div>
+            <div class="panel-body">
+              <div id="analytics-top-zones"><div class="empty">—</div></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="page" id="page-cameras">
+        <div class="page-head">
+          <div>
+            <div class="page-title">Cameras</div>
+            <div class="page-sub">RTSP sources assigned to the vehicle edge runtime.</div>
+          </div>
+          <button class="btn primary" onclick="showAddCamera()">Add Camera</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Camera ID</th>
+                <th>Name</th>
+                <th>Source</th>
+                <th>Resolution / FPS</th>
+                <th>Status</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="cam-table"><tr><td colspan="6" class="empty">Loading...</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="page" id="page-zones">
+        <div class="page-head">
+          <div>
+            <div class="page-title">Zones</div>
+            <div class="page-sub">Ramp geometry, occupancy thresholds, and dwell rules.</div>
+          </div>
+          <button class="btn primary" onclick="showAddZone()">Add Zone</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Zone ID</th>
+                <th>Name</th>
+                <th title="Which slot on the Overview ramp map this zone feeds into. Floor plan only renders zones whose name (or group name) is one of Zone 1..Zone 12 (case-sensitive).">Map slot</th>
+                <th>Ramp Side</th>
+                <th>Camera</th>
+                <th>Max Vehicles</th>
+                <th>Max Dwell</th>
+                <th>Status</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="zone-table"><tr><td colspan="9" class="empty">Loading...</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="page" id="page-edge">
+        <div class="page-head">
+          <div>
+            <div class="page-title">Edge Status</div>
+            <div class="page-sub">CPU, RAM, Intel GPU engine telemetry, and Axelera inference telemetry for each active edge runtime.</div>
+          </div>
+          <button class="btn" onclick="fetchEdge()">Refresh</button>
+        </div>
+        <div class="edge-stack" id="edge-cards"><div class="empty">Loading...</div></div>
+      </section>
+    </main>
+  </div>
+</div>
+
+<!-- Notification drawer (slides in from the right when bell is clicked) -->
+<div class="drawer-scrim" id="alert-drawer-scrim" onclick="closeAlertDrawer()" hidden></div>
+<aside class="alert-drawer" id="alert-drawer" aria-hidden="true">
+  <div class="alert-drawer-head">
+    <div>
+      <div class="alert-drawer-title">Recent Alerts</div>
+      <div class="alert-drawer-sub" id="alert-drawer-sub">Latest overcrowding and overstay signals.</div>
+    </div>
+    <button class="bell-btn" type="button" onclick="closeAlertDrawer()" aria-label="Close" title="Close">✕</button>
+  </div>
+  <div class="alert-drawer-body">
+    <div class="alert-list" id="alert-list"><div class="empty">No alerts</div></div>
+  </div>
+  <div class="alert-drawer-foot">
+    <a href="#alerts" onclick="closeAlertDrawer(); return navigateToPage('alerts')" class="btn">View all alerts →</a>
+  </div>
+</aside>
+
+<!-- Toast container (top-right, stacks new alerts; each auto-dismisses) -->
+<div class="toast-stack" id="toast-stack" aria-live="polite" aria-atomic="false"></div>
+
+<div class="modal-bg" id="modal-cam">
+  <div class="modal">
+    <h3>Add Camera</h3>
+    <div class="form-group"><label>Camera ID</label><input id="f-cam-id" placeholder="cam-01"></div>
+    <div class="form-group"><label>Name</label><input id="f-cam-name" placeholder="Arrival Ramp 1"></div>
+    <div class="form-group"><label>RTSP URL</label><input id="f-cam-url" placeholder="rtsp://user:pass@10.0.0.5:554/stream1"></div>
+    <div class="form-group"><label>Assigned Edge</label><select id="f-cam-edge"><option value="vehicle-edge-01">vehicle-edge-01</option></select></div>
+    <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:6px">
+      <button class="btn" onclick="closeModal('modal-cam')">Cancel</button>
+      <button class="btn primary" onclick="submitCamera()">Add Camera</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-bg" id="modal-zone">
+  <div class="modal wide">
+    <h3 id="zone-modal-title">Add Zone</h3>
+    <div class="zone-editor">
+      <div>
+        <div class="form-group"><label>Zone ID</label><input id="f-zone-id" placeholder="zone-arrival-ramp-1"></div>
+        <div class="form-group"><label>Name</label><input id="f-zone-name" placeholder="Arrival Ramp 1"></div>
+        <div class="form-group"><label>Camera</label><select id="f-zone-cam" onchange="onZoneCameraChange()"><option value="">No camera</option></select></div>
+        <div class="form-group">
+          <label>Group (optional)</label>
+          <div style="display:flex;gap:8px;align-items:center">
+            <select id="f-zone-group" style="flex:1" onchange="updateGroupEditButton()">
+              <option value="">— No group (standalone zone) —</option>
+            </select>
+            <button type="button" class="btn" id="f-zone-group-edit-btn" onclick="openGroupEditor('edit')" title="Edit the selected group" disabled>Edit</button>
+            <button type="button" class="btn" id="f-zone-group-new-btn" onclick="openGroupEditor('create')" title="Create a new group">+ New</button>
+          </div>
+          <div class="zone-help" style="margin-top:6px">A group aggregates this camera's count with other cameras that cover the same physical zone (e.g. "Zone 5" seen from 4 angles).</div>
+
+          <div id="zone-group-creator" hidden style="margin-top:10px;padding:12px 14px;border:1px solid var(--line);border-radius:10px;background:#f8fafc">
+            <div id="f-group-editor-title" style="font-weight:700;font-size:13px;color:#0f172a;margin-bottom:8px">New group</div>
+            <div class="form-group" style="margin-bottom:8px">
+              <label>Name</label>
+              <input id="f-new-group-name" placeholder="Zone 5" oninput="onNewGroupNameInput()">
+            </div>
+            <div class="form-group" style="margin-bottom:8px">
+              <label>Group ID</label>
+              <input id="f-new-group-id" placeholder="zg-zone-5">
+            </div>
+            <div class="form-group" style="margin-bottom:0">
+              <label>Max vehicles for the whole group <span style="font-weight:400;color:var(--muted)">(optional)</span></label>
+              <input id="f-new-group-max" type="number" min="0" placeholder="e.g. 10 — total across all member cameras">
+              <div class="zone-help" style="margin-top:6px">Fires <b>one</b> overcrowding alert when the sum of vehicle counts across all member cameras exceeds this value. Per-camera overcrowding alerts are suppressed for zones in this group — the group-level alert covers it.</div>
+            </div>
+            <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px">
+              <button type="button" class="btn" onclick="toggleGroupCreator(false)">Cancel</button>
+              <button type="button" class="btn primary" id="f-group-editor-submit" onclick="submitGroupEditor()">Create group</button>
+            </div>
+          </div>
+        </div>
+        <div class="form-group"><label>Ramp Side</label><select id="f-zone-ramp"><option value="">Select ramp side</option><option value="inner">Inner ramp</option><option value="outer">Outer ramp</option></select></div>
+        <div class="form-grid">
+          <div class="form-group"><label>Max Vehicles</label><input id="f-zone-max" type="number" value="20"></div>
+          <div class="form-group"><label>Max Dwell (s)</label><input id="f-zone-dwell" type="number" value="900"></div>
+        </div>
+        <div class="form-group"><label>Zone Polygon JSON</label><textarea id="f-zone-poly" rows="4" readonly placeholder="Draw on the snapshot to generate polygon points"></textarea></div>
+        <div class="zone-help">This follows the airport queue setup pattern: pick a camera, draw the zone directly on the snapshot, and the edge-ready polygon coordinates are generated automatically.</div>
+      </div>
+      <div class="zone-mobile-notice">
+        <strong>Polygon editing isn't available on mobile</strong>
+        Drawing zone boundaries needs a precise pointer and a wider screen — open the dashboard on a laptop or desktop to draw or change the polygon. You can still edit the name, capacity, dwell threshold and other settings here.
+      </div>
+      <div class="zone-canvas-wrap">
+        <div class="zone-tools">
+          <button class="btn" type="button" onclick="finishZonePolygon()">Finish Polygon</button>
+          <button class="btn" type="button" onclick="undoZonePoint()">Undo Point</button>
+          <button class="btn" type="button" onclick="clearZonePolygon()">Clear Polygon</button>
+          <button class="btn" type="button" onclick="reloadZoneSnapshot()">Reload Snapshot</button>
+        </div>
+        <canvas id="zone-canvas" class="zone-canvas" width="800" height="500"></canvas>
+        <div class="poly-status" id="zone-poly-status">Select a camera and click on the canvas to start drawing.</div>
+      </div>
+    </div>
+    <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:18px">
+      <button class="btn" onclick="closeModal('modal-zone')">Cancel</button>
+      <button class="btn primary" id="zone-submit-btn" onclick="submitZone()">Create Zone</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = '';
+let ws, zoneData = {}, alertData = [], fullAlertData = [], overviewData = {};
+
+// Map an alert's zone_id to a human label.
+// Overstay alerts carry a real per-camera zone_id; overcrowding alerts may
+// carry a group_id (the alert engine piggybacks group alerts on the same
+// column). Try zoneData first; if it's a group_id, walk the cached zones
+// to find any member whose group_name we can show. Fall back to the raw id.
+function alertZoneLabel(zoneId){
+  if(!zoneId) return '';
+  const z = zoneData[zoneId];
+  if(z){
+    return z.group_name || z.name || zoneId;
+  }
+  for(const candidate of Object.values(zoneData)){
+    if(candidate.zone_group_id === zoneId && candidate.group_name){
+      return candidate.group_name;
+    }
+  }
+  return zoneId;
+}
+// Server-authoritative counts for the Alerts stat cards. Populated by the
+// /api/alerts response (which now returns {alerts, counts}). The acked
+// count survives page reloads and reflects the real DB state — the older
+// in-memory sessionAckedCount was zero on reload because "unacked only"
+// stripped acked rows from the list before stats could be derived from it.
+let fullAlertCounts = null;
+// Alerts page pagination state. Both reset to 0/default when the operator
+// changes a filter or page size; live WS updates preserve the index so the
+// operator isn't yanked back to page 1 every time a new alert lands.
+let alertsPageIndex = 0;
+let alertsPerPage = 50;
+let zoneCameras = [], zonePolygon = [], zoneSnapshot = null;
+const VALID_PAGES = new Set(['overview', 'live', 'feed', 'alerts', 'analytics', 'cameras', 'zones', 'edge']);
+// Admin = served to localhost; viewer = LAN client. Determined at boot
+// from /api/whoami. Pages in ADMIN_PAGES are unreachable for viewers — both
+// the sidebar entries are CSS-hidden and direct hash navigation is rewritten
+// to 'overview'. Server middleware also blocks the underlying mutating API
+// calls, so the UI hide is purely cosmetic.
+const ADMIN_PAGES = new Set(['cameras', 'zones', 'edge', 'feed']);
+let isAdminUser = false;
+let currentPage = '';
+let liveCameraCache = [];
+let selectedLiveCamera = null;
+let zoneModalMode = 'create';
+let editingZoneId = null;
+let activeLiveRenderId = 0;
+let activeLiveStreamToken = 0;
+let liveFrameTimer = null;
+let feedEntries = [];
+let feedPaused = false;
+let feedSelectedId = null;
+let feedFilter = '';
+let feedTotalMessages = 0;
+let feedTotalBytes = 0;
+let feedRateWindow = [];
+let feedSequence = 0;
+const FEED_ENTRY_LIMIT = 600;
+const LIVE_PREVIEW_INTERVAL_MS = 500;
+
+function $(id){ return document.getElementById(id); }
+
+function tickClock(){
+  const now = new Date();
+  const label = now.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+  $('top-clock').textContent = label;
+}
+setInterval(tickClock, 1000);
+tickClock();
+
+function escapeHtml(value){
+  return String(value ?? '').replace(/[&<>"']/g, s => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[s]));
+}
+
+function fmtTime(ts){
+  if(!ts) return '';
+  return new Date(typeof ts === 'number' ? ts * 1000 : ts).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+}
+
+function fmtDuration(seconds){
+  const s = Math.max(0, Number(seconds || 0));
+  if(s >= 3600) return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
+  if(s >= 60) return `${Math.floor(s / 60)}m ${Math.floor(s % 60)}s`;
+  return `${Math.round(s)}s`;
+}
+
+// Short, scannable alert title. The full edge-supplied message duplicated
+// info already visible in the chip row (zone, vehicle id, arrival time),
+// which made the row a paragraph instead of a glanceable line. Render just
+// the actionable delta — how long, how much over — and let the chips carry
+// the rest. Falls back to the raw message if the type or numbers are
+// missing, so unknown alert types still render readably.
+function alertHeadline(alert){
+  if(!alert) return 'Alert';
+  const type = alert.alert_type;
+  // Maintenance alerts (camera offline / recovered) aren't tied to a zone —
+  // their message is already self-describing, so show it verbatim.
+  if(type === 'camera_offline' || type === 'camera_recovered'){
+    return alert.message || (type === 'camera_offline' ? 'Camera offline' : 'Camera recovered');
+  }
+  // Always lead the headline with the LIVE zone label, not the alert's
+  // stored message text. Historical alert rows can carry stale per-camera
+  // names (e.g. "Arrival ramp .150 — Full Zone:") from before the zone
+  // was renamed/grouped — those are frozen at write time. The chip below
+  // already shows the same label, but operators read the message first
+  // and the stale text is what triggered the "show zone names" complaint.
+  const zoneLabel = alertZoneLabel(alert.zone_id);
+  const lead = zoneLabel ? `${zoneLabel} — ` : '';
+  if(type === 'overstay' && alert.dwell_time_s != null){
+    const dwell = Number(alert.dwell_time_s);
+    const thresh = Number(zoneData[alert.zone_id]?.max_dwell_time_s || 0);
+    const dwellTxt = fmtDuration(dwell);
+    if(thresh > 0 && dwell > thresh){
+      return `${lead}Overstay ${dwellTxt} in zone, ${fmtDuration(dwell - thresh)} over limit`;
+    }
+    return `${lead}Overstay ${dwellTxt} in zone`;
+  }
+  if(type === 'overcrowding' && alert.vehicle_count != null){
+    const n = Number(alert.vehicle_count);
+    return `${lead}Overcrowding — ${n} vehicle${n === 1 ? '' : 's'} in zone`;
+  }
+  return alert.message || type || 'Alert';
+}
+
+function fmtDateTime(ts){
+  if(!ts) return '—';
+  const raw = typeof ts === 'number' && ts < 1e12 ? ts * 1000 : ts;
+  return new Date(raw).toLocaleString([], {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit', second:'2-digit'});
+}
+
+function fmtUptimeCompact(seconds){
+  const total = Math.max(0, Number(seconds || 0));
+  const days = Math.floor(total / 86400);
+  const hours = Math.floor((total % 86400) / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  if(days > 0) return `${days}d ${hours}h`;
+  return `${hours}h ${minutes}m`;
+}
+
+function fmtFeedTime(ms){
+  const d = new Date(ms);
+  const time = d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false});
+  return `${time}.${String(d.getMilliseconds()).padStart(3, '0')}`;
+}
+
+function fmtBytes(bytes){
+  const num = Number(bytes || 0);
+  if(!Number.isFinite(num) || num <= 0) return '0 B';
+  if(num < 1024) return `${Math.round(num)} B`;
+  if(num < 1024 * 1024) return `${(num / 1024).toFixed(1)} KB`;
+  return `${(num / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function jsonString(value, space = 0){
+  try { return JSON.stringify(value, null, space); }
+  catch(e){ return String(value); }
+}
+
+function normalizeRampType(value){
+  const v = String(value || '').trim().toLowerCase();
+  return v === 'inner' || v === 'outer' ? v : '';
+}
+
+function inferRampType(zone){
+  const explicit = normalizeRampType(zone?.ramp_type);
+  if(explicit) return explicit;
+  const text = `${zone?.name || ''} ${zone?.zone_id || ''} ${zone?.camera_id || ''}`.toLowerCase();
+  if(text.includes('outer')) return 'outer';
+  if(text.includes('inner')) return 'inner';
+  return '';
+}
+
+function rampTypeLabel(value){
+  const normalized = normalizeRampType(value);
+  if(normalized === 'inner') return 'Inner ramp';
+  if(normalized === 'outer') return 'Outer ramp';
+  return 'Ramp side not set';
+}
+
+function zoneOccupancyPct(zone){
+  const livePct = Number(zone?.occupancy_pct);
+  if(Number.isFinite(livePct) && livePct > 0) return livePct;
+  const count = Number(zone?.vehicle_count || 0);
+  const max = Number(zone?.max_vehicles || 0);
+  return max > 0 ? (count / max) * 100 : 0;
+}
+
+function occupancyTone(pct){
+  if(pct < 50) return 'green';
+  if(pct <= 95) return 'amber';
+  return 'red';
+}
+
+function mergeZoneRecord(zone){
+  const existing = zoneData[zone.zone_id] || {};
+  zoneData[zone.zone_id] = {...existing, ...zone};
+}
+
+function bumpUnackedAlerts(delta){
+  const current = Number(overviewData.unacked_alerts || 0);
+  overviewData.unacked_alerts = Math.max(0, current + delta);
+  syncBellBadge();
+}
+
+// ---- Notification bell + drawer ----
+function syncBellBadge(){
+  const badge = $('bell-badge');
+  const btn = $('bell-btn');
+  if(!badge || !btn) return;
+  const n = Number(overviewData.unacked_alerts || 0);
+  if(n > 0){
+    badge.hidden = false;
+    badge.textContent = n > 99 ? '99+' : String(n);
+    btn.classList.add('has-unacked');
+  } else {
+    badge.hidden = true;
+    btn.classList.remove('has-unacked');
+  }
+}
+
+function toggleAlertDrawer(){
+  const drawer = $('alert-drawer');
+  if(drawer.classList.contains('open')) closeAlertDrawer();
+  else openAlertDrawer();
+}
+function openAlertDrawer(){
+  const drawer = $('alert-drawer');
+  const scrim = $('alert-drawer-scrim');
+  drawer.classList.add('open');
+  drawer.setAttribute('aria-hidden', 'false');
+  scrim.hidden = false;
+  // Two raf ticks so the transition fires reliably after `hidden` is removed.
+  requestAnimationFrame(() => requestAnimationFrame(() => scrim.classList.add('show')));
+  renderAlerts();
+}
+function closeAlertDrawer(){
+  const drawer = $('alert-drawer');
+  const scrim = $('alert-drawer-scrim');
+  drawer.classList.remove('open');
+  drawer.setAttribute('aria-hidden', 'true');
+  scrim.classList.remove('show');
+  setTimeout(() => { scrim.hidden = true; }, 220);
+}
+
+// ---- Toasts ----
+const TOAST_LIFETIME_MS = 5000;
+const TOAST_MAX_VISIBLE = 3;
+const _toastTimers = new WeakMap();
+
+function showAlertToast(alert){
+  const stack = $('toast-stack');
+  if(!stack || !alert) return;
+  // Cap visible: drop the oldest if already at the cap.
+  while(stack.children.length >= TOAST_MAX_VISIBLE){
+    dismissToast(stack.firstElementChild, true);
+  }
+  const level = alert.level || 'warning';
+  const el = document.createElement('div');
+  el.className = `toast ${level}`;
+  el.innerHTML = `
+    <span class="toast-badge ${level}">${escapeHtml(level)}</span>
+    <div class="toast-body">
+      <div class="toast-msg" title="${escapeHtml(alert.message || '')}">${escapeHtml(alertHeadline(alert))}</div>
+      <div class="toast-meta">${escapeHtml(alertZoneLabel(alert.zone_id) || '—')} · just now</div>
+    </div>
+  `;
+  // Click anywhere on the toast → open the drawer (operator can act from there).
+  el.addEventListener('click', () => { dismissToast(el); openAlertDrawer(); });
+  // Pause the auto-dismiss timer while the operator is hovering.
+  el.addEventListener('mouseenter', () => {
+    const t = _toastTimers.get(el);
+    if(t){ clearTimeout(t); _toastTimers.delete(el); }
+  });
+  el.addEventListener('mouseleave', () => scheduleToastDismiss(el));
+  stack.appendChild(el);
+  scheduleToastDismiss(el);
+}
+function scheduleToastDismiss(el){
+  if(!el || !el.isConnected) return;
+  const timer = setTimeout(() => dismissToast(el), TOAST_LIFETIME_MS);
+  _toastTimers.set(el, timer);
+}
+function dismissToast(el, immediate){
+  if(!el || !el.isConnected) return;
+  const t = _toastTimers.get(el);
+  if(t){ clearTimeout(t); _toastTimers.delete(el); }
+  if(immediate){ el.remove(); return; }
+  el.classList.add('fading');
+  setTimeout(() => el.remove(), 350);
+}
+
+function statusChip(status){
+  const normalized = String(status || 'unknown').toLowerCase();
+  const cls = normalized === 'online' ? 'online' : normalized === 'error' ? 'error' : normalized === 'warning' ? 'warning' : 'offline';
+  return `<span class="status-chip ${cls}"><span class="dot"></span>${escapeHtml(normalized)}</span>`;
+}
+
+function fmtPct(value, digits = 1){
+  const num = Number(value);
+  return Number.isFinite(num) ? `${num.toFixed(digits)}%` : '—';
+}
+
+function fmtNumber(value, digits = 1){
+  const num = Number(value);
+  return Number.isFinite(num) ? num.toFixed(digits) : '—';
+}
+
+function fmtMegabytes(used, total){
+  const usedNum = Number(used);
+  const totalNum = Number(total);
+  if(!Number.isFinite(usedNum) || !Number.isFinite(totalNum)) return '—';
+  return `${usedNum.toFixed(0)} / ${totalNum.toFixed(0)} MB`;
+}
+
+function usageTone(value){
+  const num = Number(value);
+  if(!Number.isFinite(num)) return 'blue';
+  if(num >= 85) return 'red';
+  if(num >= 55) return 'amber';
+  return 'green';
+}
+
+function edgeHealthState(edge){
+  const ts = Number(edge?.ts || 0);
+  if(!ts) return {label:'offline', tone:'offline'};
+  const age = (Date.now() / 1000) - ts;
+  if(age > 30) return {label:'offline', tone:'offline'};
+  if(age > 15) return {label:'stale', tone:'warning'};
+  if(Number(edge?.cameras_errored || 0) > 0) return {label:'degraded', tone:'warning'};
+  return {label:'online', tone:'online'};
+}
+
+function edgeHealthChip(edge){
+  const state = edgeHealthState(edge);
+  return `<span class="status-chip ${state.tone}"><span class="dot"></span>${escapeHtml(state.label)}</span>`;
+}
+
+function renderEdgeMetric(label, value, tone, note){
+  return `
+    <div class="metric-card ${escapeHtml(tone)}">
+      <div class="metric-label">${escapeHtml(label)}</div>
+      <div class="metric-value ${escapeHtml(tone)}">${escapeHtml(value)}</div>
+      <div class="metric-note">${escapeHtml(note)}</div>
+    </div>
+  `;
+}
+
+function feedTopicFromMessage(msg){
+  const type = String(msg?.type || '').toLowerCase();
+  if(type === 'subscribed' || type === 'unsubscribed') return type;
+  if(type === 'connected' || type === 'disconnected' || type === 'socket_error' || type === 'parse_error') return 'socket';
+  if(type === 'zone_metric'){
+    const zoneId = msg.zone_id || msg.data?.zone_id;
+    return zoneId ? `zone/${zoneId}` : 'zone';
+  }
+  if(type === 'alert'){
+    const zoneId = msg.zone_id || msg.data?.zone_id;
+    return zoneId ? `alert/${zoneId}` : 'alert';
+  }
+  if(type === 'overview') return 'overview';
+  return String(msg?.topic || msg?.action || type || 'unknown');
+}
+
+function feedTypeClass(type){
+  const normalized = String(type || '').toLowerCase();
+  if(normalized === 'overview') return 'overview';
+  if(normalized === 'zone_metric') return 'zone';
+  if(normalized === 'alert') return 'alert';
+  if(normalized === 'subscribed' || normalized === 'connected') return 'system';
+  if(normalized === 'unsubscribed' || normalized === 'disconnected' || normalized === 'socket_error' || normalized === 'parse_error') return 'muted';
+  return 'default';
+}
+
+function feedPreview(entry){
+  const type = String(entry?.type || '').toLowerCase();
+  const payload = entry?.payload || {};
+  const data = payload?.data || payload;
+  if(type === 'zone_metric'){
+    const vehicles = data.vehicle_count ?? data.active_tracks ?? '?';
+    const dwell = Number(data.avg_dwell_time_s ?? data.avg_wait_s);
+    const dwellLabel = Number.isFinite(dwell) ? `${dwell.toFixed(1)}s` : '?';
+    const overstay = data.overstay_count ?? 0;
+    return `V:${vehicles} D:${dwellLabel} Over:${overstay}`;
+  }
+  if(type === 'overview'){
+    return `Vehicles:${data.total_vehicles ?? '?'} Zones:${data.total_zones ?? '?'} Alerts:${data.unacked_alerts ?? '?'}`;
+  }
+  if(type === 'alert'){
+    return data.message || data.alert_type || 'Alert';
+  }
+  if(type === 'subscribed' || type === 'unsubscribed'){
+    return jsonString(payload).slice(0, 140);
+  }
+  return jsonString(data).slice(0, 140);
+}
+
+function getFilteredFeedEntries(){
+  const query = feedFilter.trim().toLowerCase();
+  if(!query) return feedEntries;
+  return feedEntries.filter(entry => {
+    const blob = `${entry.type} ${entry.topic} ${jsonString(entry.payload)}`.toLowerCase();
+    return blob.includes(query);
+  });
+}
+
+function renderFeedStats(){
+  if(!$('feed-rate')) return;
+  const rate = feedRateWindow.length / 5;
+  $('feed-rate').textContent = rate.toFixed(rate >= 10 ? 0 : 1);
+  $('feed-total').textContent = feedTotalMessages.toLocaleString();
+  $('feed-bytes').textContent = fmtBytes(feedTotalBytes);
+  $('feed-avg').textContent = feedTotalMessages ? fmtBytes(Math.round(feedTotalBytes / feedTotalMessages)) : '0 B';
+  const toggle = $('feed-toggle');
+  if(toggle){
+    toggle.textContent = feedPaused ? 'Resume' : 'Pause';
+    toggle.className = `feed-btn ${feedPaused ? 'resume' : 'pause'}`;
+  }
+}
+
+function renderFeedList(){
+  const el = $('feed-list');
+  if(!el) return;
+  const entries = getFilteredFeedEntries();
+  if(!entries.length){
+    el.innerHTML = `<div class="feed-empty">${feedEntries.length ? 'No messages match the current filter.' : 'Waiting for websocket traffic...'}</div>`;
+    return;
+  }
+  el.innerHTML = entries.map(entry => `
+    <div class="feed-row ${entry.id === feedSelectedId ? 'active' : ''}" onclick="selectFeedEntry(${entry.id})">
+      <div class="feed-cell-muted feed-cell-mono">${escapeHtml(entry.ts)}</div>
+      <div><span class="feed-type ${feedTypeClass(entry.type)}">${escapeHtml(entry.type)}</span></div>
+      <div class="feed-cell-truncate">${escapeHtml(entry.topic)}</div>
+      <div class="feed-cell-muted feed-cell-mono">${escapeHtml(fmtBytes(entry.sizeBytes))}</div>
+      <div class="feed-cell-muted feed-cell-truncate">${escapeHtml(feedPreview(entry))}</div>
+    </div>
+  `).join('');
+}
+
+function renderFeedDetail(){
+  const el = $('feed-detail');
+  if(!el) return;
+  const entry = feedEntries.find(item => item.id === feedSelectedId);
+  if(!entry){
+    el.innerHTML = '<div class="feed-empty">Click a message to inspect</div>';
+    return;
+  }
+  el.innerHTML = `
+    <div class="feed-meta-grid">
+      <div>
+        <div class="feed-meta-label">Time</div>
+        <div class="feed-meta-value feed-cell-mono">${escapeHtml(entry.ts)}</div>
+      </div>
+      <div>
+        <div class="feed-meta-label">Size</div>
+        <div class="feed-meta-value feed-cell-mono">${escapeHtml(fmtBytes(entry.sizeBytes))}</div>
+      </div>
+      <div>
+        <div class="feed-meta-label">Type</div>
+        <div class="feed-meta-value"><span class="feed-type ${feedTypeClass(entry.type)}">${escapeHtml(entry.type)}</span></div>
+      </div>
+      <div>
+        <div class="feed-meta-label">Topic</div>
+        <div class="feed-meta-value feed-cell-mono">${escapeHtml(entry.topic)}</div>
+      </div>
+    </div>
+    <div class="feed-meta-label" style="margin-bottom:8px">Full Payload</div>
+    <pre class="feed-json">${escapeHtml(jsonString(entry.payload, 2))}</pre>
+  `;
+}
+
+function renderFeed(){
+  renderFeedStats();
+  renderFeedList();
+  renderFeedDetail();
+}
+
+function recordFeedMessage(payload, forcedType = '', forcedTopic = ''){
+  const type = String(forcedType || payload?.type || 'unknown');
+  const topic = forcedTopic || feedTopicFromMessage(payload);
+  const raw = jsonString(payload);
+  const sizeBytes = new TextEncoder().encode(raw).length;
+  const now = Date.now();
+  feedRateWindow.push(now);
+  feedRateWindow = feedRateWindow.filter(ts => now - ts < 5000);
+  feedTotalMessages += 1;
+  feedTotalBytes += sizeBytes;
+
+  const entry = {
+    id: ++feedSequence,
+    ts: fmtFeedTime(now),
+    tsRaw: now,
+    type,
+    topic,
+    payload,
+    sizeBytes,
+  };
+
+  if(!feedPaused){
+    feedEntries = [entry, ...feedEntries].slice(0, FEED_ENTRY_LIMIT);
+    if(feedSelectedId && !feedEntries.some(item => item.id === feedSelectedId)){
+      feedSelectedId = null;
+    }
+  }
+  renderFeed();
+  return entry;
+}
+
+function toggleFeedPause(){
+  feedPaused = !feedPaused;
+  renderFeed();
+}
+
+function clearFeed(){
+  feedEntries = [];
+  feedSelectedId = null;
+  feedFilter = '';
+  feedTotalMessages = 0;
+  feedTotalBytes = 0;
+  feedRateWindow = [];
+  if($('feed-filter')) $('feed-filter').value = '';
+  renderFeed();
+}
+
+function exportFeed(){
+  const blob = new Blob([jsonString(feedEntries, 2)], {type:'application/json'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `vehicle-data-feed-${new Date().toISOString().replace(/[:]/g, '-').slice(0, 19)}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function onFeedFilterChange(){
+  feedFilter = $('feed-filter')?.value || '';
+  renderFeed();
+}
+
+function selectFeedEntry(id){
+  feedSelectedId = Number(id);
+  renderFeed();
+}
+
+function sendWsTopics(action, topics){
+  const list = (Array.isArray(topics) ? topics : []).filter(Boolean);
+  if(!list.length || !ws || ws.readyState !== 1) return false;
+  ws.send(JSON.stringify({action, topics:list}));
+  const syntheticType = action === 'unsubscribe' ? 'unsubscribed' : 'subscribed';
+  recordFeedMessage({type: syntheticType, topics: list}, syntheticType, syntheticType);
+  return true;
+}
+
+function renderEdgeUtilBar(label, value, note, color, icon){
+  const pct = Math.max(0, Math.min(Number(value) || 0, 100));
+  return `
+    <div class="edge-util">
+      <div class="edge-util-top">
+        <div class="edge-util-label"><i>${escapeHtml(icon)}</i><span>${escapeHtml(label)}</span></div>
+        <div class="edge-util-value">${escapeHtml(fmtPct(value))}</div>
+      </div>
+      <div class="edge-util-track"><div class="edge-util-fill ${escapeHtml(color)}" style="width:${pct}%"></div></div>
+      <div class="edge-util-note">${escapeHtml(note || '—')}</div>
+    </div>
+  `;
+}
+
+function renderEdgeMiniCard(icon, value, label, compact = false){
+  return `
+    <div class="edge-mini-card">
+      <div class="edge-mini-icon">${escapeHtml(icon)}</div>
+      <div class="edge-mini-value ${compact ? 'compact' : ''}">${escapeHtml(value)}</div>
+      <div class="edge-mini-label">${escapeHtml(label)}</div>
+    </div>
+  `;
+}
+
+function mergeAlertItems(items, incoming, limit = 50){
+  return [incoming, ...items.filter(item => item.alert_id !== incoming.alert_id)].slice(0, limit);
+}
+
+function alertMatchesPageFilter(alert){
+  const type = $('alert-filter')?.value || '';
+  const unackedOnly = Boolean($('alert-unacked-only')?.checked);
+  return (!type || alert.alert_type === type) && (!unackedOnly || !alert.acknowledged);
+}
+
+function normalizePage(page){
+  const cleaned = String(page || '').replace(/^#/, '').trim();
+  if(!VALID_PAGES.has(cleaned)) return 'overview';
+  if(!isAdminUser && ADMIN_PAGES.has(cleaned)) return 'overview';
+  return cleaned;
+}
+
+function navigateToPage(page){
+  // On mobile (off-canvas sidebar is open), close it so the
+  // newly-selected page is visible immediately.
+  if(window.innerWidth <= 700) closeSidebar();
+  const target = normalizePage(page);
+  const targetHash = '#' + target;
+  if(window.location.hash !== targetHash){
+    window.location.hash = target;
+  } else {
+    showPage(target, {updateHash:false, force:true});
+  }
+  return false;
+}
+
+function toggleSidebar(){
+  document.querySelector('.sidebar')?.classList.toggle('open');
+  document.getElementById('sidebar-scrim')?.classList.toggle('open');
+}
+function closeSidebar(){
+  document.querySelector('.sidebar')?.classList.remove('open');
+  document.getElementById('sidebar-scrim')?.classList.remove('open');
+}
+
+function showPage(page, options = {}){
+  const opts = {updateHash:false, force:false, ...options};
+  const requested = String(page || '').replace(/^#/, '').trim();
+  page = normalizePage(page);
+  // If we redirected (e.g. viewer asked for an admin page), keep the
+  // URL hash in sync so refresh and back/forward stay consistent.
+  const redirected = requested && requested !== page;
+  if(page === currentPage && !opts.force){
+    if((opts.updateHash || redirected) && window.location.hash !== '#' + page){
+      window.location.hash = page;
+    }
+    return;
+  }
+  if(currentPage === 'live' && page !== 'live'){ teardownLiveView(); stopLiveSideTimer(); }
+  currentPage = page;
+  document.querySelectorAll('.page').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.nav a').forEach(el => el.classList.remove('active'));
+  $('page-' + page).classList.add('active');
+  $('nav-' + page).classList.add('active');
+  if((opts.updateHash || redirected) && window.location.hash !== '#' + page){
+    window.location.hash = page;
+  }
+
+  if(page === 'cameras') fetchCameras();
+  if(page === 'zones') fetchZones();
+  if(page === 'alerts') fetchAlertsFull();
+  if(page === 'edge') fetchEdge();
+  if(page === 'feed') renderFeed();
+  if(page === 'live'){ fetchLive(); startLiveSideTimer(); }
+  if(page === 'analytics') fetchAnalytics();
+}
+
+function showAddCamera(){
+  // Populate the Assigned Edge dropdown from the live edges list. Without
+  // this, a hardcoded value="vehicle-edge-01" silently misrouted new cameras
+  // on multi-edge deployments.
+  const sel = $('f-cam-edge');
+  fetch(API + '/api/overview').then(r => r.json()).then(data => {
+    const edges = (data && data.edges) || [];
+    if(edges.length){
+      sel.innerHTML = edges.map(e => `<option value="${escapeHtml(e.edge_id)}">${escapeHtml(e.edge_id)}</option>`).join('');
+    }
+  }).catch(() => {/* keep whatever placeholder option is already in the DOM */});
+  $('modal-cam').classList.add('show');
+}
+function closeModal(id){
+  $(id).classList.remove('show');
+  if(id === 'modal-zone') resetZoneForm();
+}
+
+function zoneCtx(){ return $('zone-canvas').getContext('2d'); }
+function setZoneStatus(msg){ $('zone-poly-status').textContent = msg; }
+function syncZonePolyField(){ $('f-zone-poly').value = zonePolygon.length ? JSON.stringify(zonePolygon) : ''; }
+function setZoneModalMode(mode){
+  zoneModalMode = mode;
+  $('zone-modal-title').textContent = mode === 'edit' ? 'Edit Zone' : 'Add Zone';
+  $('zone-submit-btn').textContent = mode === 'edit' ? 'Update Zone' : 'Create Zone';
+  $('f-zone-id').readOnly = mode === 'edit';
+  $('f-zone-id').style.opacity = mode === 'edit' ? '0.7' : '1';
+}
+
+function normalizeZonePolygon(poly){
+  if(typeof poly === 'string'){
+    try { poly = JSON.parse(poly); }
+    catch(e){ return []; }
+  }
+  if(!Array.isArray(poly)) return [];
+  return poly
+    .filter(pt => Array.isArray(pt) && pt.length >= 2)
+    .map(pt => [Math.round(Number(pt[0]) || 0), Math.round(Number(pt[1]) || 0)]);
+}
+
+function loadZoneCameras(selectedCameraId = ''){
+  return fetch(API + '/api/cameras')
+    .then(r => r.json())
+    .then(cams => {
+      zoneCameras = cams || [];
+      $('f-zone-cam').innerHTML = '<option value="">No camera</option>' + zoneCameras.map(c => `<option value="${escapeHtml(c.camera_id)}">${escapeHtml(c.name || c.camera_id)}</option>`).join('');
+      $('f-zone-cam').value = selectedCameraId || '';
+      return zoneCameras;
+    });
+}
+
+// Inline group editor — dual-mode (create vs edit), opens directly
+// under the Group dropdown in the Zone editor. Replaced an earlier
+// sequence of native prompt() pop-ups; "Edit" added so operators can
+// backfill the group's max_vehicles threshold without needing a
+// separate management page.
+let groupEditorMode = 'create';
+
+function updateGroupEditButton(){
+  // Edit button is enabled iff a real group is selected (the "no group"
+  // option has value "").
+  const editBtn = $('f-zone-group-edit-btn');
+  if(!editBtn) return;
+  const selected = $('f-zone-group')?.value || '';
+  editBtn.disabled = !selected;
+}
+
+async function openGroupEditor(mode){
+  const box = $('zone-group-creator');
+  if(!box) return;
+  groupEditorMode = mode;
+  const title = $('f-group-editor-title');
+  const submitBtn = $('f-group-editor-submit');
+  const idField = $('f-new-group-id');
+  if(mode === 'edit'){
+    const groupId = ($('f-zone-group').value || '').trim();
+    if(!groupId) return;  // belt-and-braces; button should be disabled
+    // Pull the group's current values so the form is pre-filled.
+    let g = {};
+    try {
+      g = await fetch(API + '/api/zone_groups/' + encodeURIComponent(groupId)).then(r => r.json());
+    } catch (e) {
+      alert('Failed to load group');
+      return;
+    }
+    title.textContent = `Edit group: ${g.name || groupId}`;
+    submitBtn.textContent = 'Save group';
+    $('f-new-group-name').value = g.name || '';
+    idField.value = g.group_id || groupId;
+    idField.readOnly = true;  // PK can't change
+    idField.style.background = '#f1f5f9';
+    $('f-new-group-max').value = (g.max_vehicles == null) ? '' : String(g.max_vehicles);
+  } else {
+    // create
+    const zoneName = ($('f-zone-name')?.value || '').trim();
+    title.textContent = 'New group';
+    submitBtn.textContent = 'Create group';
+    $('f-new-group-name').value = zoneName;
+    idField.value = suggestedGroupId(zoneName);
+    idField.readOnly = false;
+    idField.style.background = '';
+    $('f-new-group-max').value = '';
+  }
+  box.hidden = false;
+  setTimeout(() => $('f-new-group-name')?.focus(), 0);
+  $('f-zone-group-new-btn').disabled = true;
+  $('f-zone-group-edit-btn').disabled = true;
+}
+
+function toggleGroupCreator(show){
+  // Compat shim — Cancel button on the editor calls this with false.
+  if(show){ openGroupEditor('create'); return; }
+  const box = $('zone-group-creator');
+  if(box) box.hidden = true;
+  const newBtn = $('f-zone-group-new-btn');
+  if(newBtn) newBtn.disabled = false;
+  updateGroupEditButton();  // Edit button availability depends on dropdown selection
+}
+
+function suggestedGroupId(name){
+  // kebab-case prefixed with `zg-`, stripped to safe URL chars.
+  const slug = String(name || '').toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+  return slug ? `zg-${slug}` : '';
+}
+
+function onNewGroupNameInput(){
+  // Live-derive the Group ID from the Name so the operator typically
+  // just types a name and hits Create. They can still override the ID
+  // by typing in that field directly.
+  const idField = $('f-new-group-id');
+  if(!idField) return;
+  // Only auto-update the ID if the operator hasn't manually edited it
+  // (heuristic: ID matches the previous suggestion). Stash the previous
+  // suggested ID on the field so we can compare.
+  const cur = idField.value;
+  const prev = idField.dataset.lastSuggested || '';
+  if(cur === '' || cur === prev){
+    const fresh = suggestedGroupId($('f-new-group-name').value);
+    idField.value = fresh;
+    idField.dataset.lastSuggested = fresh;
+  }
+}
+
+function submitGroupEditor(){
+  const name = ($('f-new-group-name').value || '').trim();
+  const group_id = ($('f-new-group-id').value || '').trim();
+  if(!name){ $('f-new-group-name').focus(); return; }
+  if(!group_id){ $('f-new-group-id').focus(); return; }
+  const maxV = $('f-new-group-max').value.trim();
+  // null = no group threshold (per-zone alerts apply unchanged for any
+  // ungrouped zones; grouped zones simply produce no overcrowding alert).
+  // Any positive integer triggers the group-level evaluator in
+  // alert_engine._evaluate_group.
+  const max_vehicles = maxV === '' ? null : parseInt(maxV, 10);
+  const payload = { group_id, name, max_vehicles };
+  const isEdit = groupEditorMode === 'edit';
+  const url = isEdit
+    ? API + '/api/zone_groups/' + encodeURIComponent(group_id)
+    : API + '/api/zone_groups';
+  fetch(url, {
+    method: isEdit ? 'PUT' : 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload),
+  }).then(async r => {
+    if(!r.ok){
+      const err = await r.json().catch(() => ({}));
+      alert(err.detail || `Failed to ${isEdit ? 'update' : 'create'} group`);
+      return;
+    }
+    // Refresh dropdown; keep the just-edited / just-created group
+    // selected so the operator can immediately save the zone.
+    await loadZoneGroups(group_id);
+    toggleGroupCreator(false);
+  }).catch(err => alert(err));
+}
+
+function loadZoneGroups(selectedGroupId = ''){
+  // Populates the "Group (optional)" select on the zone editor with all
+  // existing groups, so an operator can either add this camera-zone to an
+  // existing group or leave it standalone. Adding the camera-zone to an
+  // existing group is the common case once the group has been created.
+  return fetch(API + '/api/zone_groups')
+    .then(r => r.json())
+    .then(groups => {
+      const opts = ['<option value="">— No group (standalone zone) —</option>'];
+      for(const g of (groups || [])){
+        const mem = g.zone_count ? ` (${g.zone_count} cams)` : '';
+        opts.push(`<option value="${escapeHtml(g.group_id)}">${escapeHtml(g.name)}${mem}</option>`);
+      }
+      const sel = $('f-zone-group');
+      if(sel){
+        sel.innerHTML = opts.join('');
+        sel.value = selectedGroupId || '';
+      }
+      updateGroupEditButton();
+      return groups || [];
+    })
+    .catch(() => { /* leave the placeholder option in place if listing fails */ });
+}
+
+function resetZoneForm(){
+  editingZoneId = null;
+  setZoneModalMode('create');
+  zonePolygon = [];
+  zoneSnapshot = null;
+  ['f-zone-id','f-zone-name','f-zone-poly'].forEach(id => $(id).value = '');
+  $('f-zone-ramp').value = '';
+  $('f-zone-max').value = 20;
+  $('f-zone-dwell').value = 900;
+  $('f-zone-cam').innerHTML = '<option value="">No camera</option>';
+  $('f-zone-group').innerHTML = '<option value="">— No group (standalone zone) —</option>';
+  // Collapse the inline group creator if it was still expanded from a
+  // previous session — operator opens the modal in a known clean state.
+  const creator = $('zone-group-creator');
+  if(creator) creator.hidden = true;
+  const newBtn = $('f-zone-group-new-btn');
+  if(newBtn) newBtn.disabled = false;
+  syncZonePolyField();
+  // Start with the canvas / Create button disabled until a camera snapshot
+  // loads — drawing on a blank canvas produces misaligned polygons.
+  setZoneCanvasReady(false);
+  setZoneStatus('Select a camera and click on the canvas to start drawing.');
+  drawZoneCanvas();
+}
+
+function showAddZone(){
+  resetZoneForm();
+  $('modal-zone').classList.add('show');
+  loadZoneCameras().catch(() => {});
+  loadZoneGroups().catch(() => {});
+  requestAnimationFrame(drawZoneCanvas);
+}
+
+function showEditZone(zoneId){
+  resetZoneForm();
+  editingZoneId = zoneId;
+  setZoneModalMode('edit');
+  $('modal-zone').classList.add('show');
+  Promise.all([
+    loadZoneCameras(),
+    loadZoneGroups(),
+    fetch(API + '/api/zones/' + encodeURIComponent(zoneId)).then(async r => {
+      if(!r.ok){
+        const body = await r.json().catch(() => ({}));
+        throw new Error(body.detail || 'Failed to load zone');
+      }
+      return r.json();
+    }),
+  ]).then(([, , zone]) => {
+    $('f-zone-id').value = zone.zone_id || '';
+    $('f-zone-name').value = zone.name || '';
+    $('f-zone-cam').value = zone.camera_id || '';
+    $('f-zone-group').value = zone.zone_group_id || '';
+    $('f-zone-ramp').value = normalizeRampType(zone.ramp_type);
+    $('f-zone-max').value = zone.max_vehicles ?? 20;
+    $('f-zone-dwell').value = zone.max_dwell_time_s ?? 900;
+    zonePolygon = normalizeZonePolygon(zone.zone_poly);
+    syncZonePolyField();
+    setZoneStatus(zonePolygon.length >= 3
+      ? `Loaded ${zonePolygon.length} polygon points. Adjust the zone and save when ready.`
+      : 'No saved polygon found. Draw a new zone on the canvas.');
+    onZoneCameraChange();
+  }).catch(err => {
+    alert(err?.message || 'Failed to load zone for editing');
+    closeModal('modal-zone');
+  });
+}
+
+function drawZoneCanvas(){
+  const canvas = $('zone-canvas');
+  if(!canvas) return;
+  const ctx = zoneCtx();
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  ctx.fillStyle = '#e2e8f0';
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+  if(zoneSnapshot){
+    ctx.drawImage(zoneSnapshot,0,0,canvas.width,canvas.height);
+    ctx.fillStyle = 'rgba(15,23,42,0.12)';
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+  } else {
+    ctx.fillStyle = '#64748b';
+    ctx.font = '14px Inter, sans-serif';
+    ctx.fillText('No snapshot loaded. You can still draw in 800x500 canvas space.', 20, 28);
+  }
+  if(zonePolygon.length){
+    ctx.beginPath();
+    ctx.moveTo(zonePolygon[0][0], zonePolygon[0][1]);
+    for(let i=1;i<zonePolygon.length;i++) ctx.lineTo(zonePolygon[i][0], zonePolygon[i][1]);
+    if(zonePolygon.length >= 3){
+      ctx.closePath();
+      ctx.fillStyle = 'rgba(37,99,235,0.22)';
+      ctx.fill();
+    }
+    ctx.strokeStyle = '#2563eb';
+    ctx.lineWidth = 3;
+    ctx.stroke();
+    for(const [x,y] of zonePolygon){
+      ctx.beginPath();
+      ctx.arc(x,y,5,0,Math.PI*2);
+      ctx.fillStyle = '#2563eb';
+      ctx.fill();
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+  }
+}
+
+function onZoneCanvasClick(ev){
+  // Block drawing until a real snapshot is loaded — otherwise the polygon
+  // points are pure canvas coords and won't match the camera's frame.
+  if(!zoneCanvasReady) return;
+  const canvas = $('zone-canvas');
+  const rect = canvas.getBoundingClientRect();
+  const sx = canvas.width / rect.width;
+  const sy = canvas.height / rect.height;
+  const x = Math.max(0, Math.min(canvas.width, Math.round((ev.clientX - rect.left) * sx)));
+  const y = Math.max(0, Math.min(canvas.height, Math.round((ev.clientY - rect.top) * sy)));
+  zonePolygon.push([x,y]);
+  syncZonePolyField();
+  setZoneStatus(`${zonePolygon.length} point${zonePolygon.length === 1 ? '' : 's'} added${zonePolygon.length >= 3 ? '. You can finish the polygon now.' : ''}`);
+  drawZoneCanvas();
+}
+
+function finishZonePolygon(){
+  if(zonePolygon.length < 3){
+    setZoneStatus('Add at least 3 points to create a polygon.');
+    return;
+  }
+  syncZonePolyField();
+  setZoneStatus(`Polygon ready with ${zonePolygon.length} points.`);
+  drawZoneCanvas();
+}
+
+function undoZonePoint(){
+  if(!zonePolygon.length) return;
+  zonePolygon.pop();
+  syncZonePolyField();
+  setZoneStatus(zonePolygon.length ? `${zonePolygon.length} point${zonePolygon.length === 1 ? '' : 's'} remaining.` : 'Polygon cleared.');
+  drawZoneCanvas();
+}
+
+function clearZonePolygon(){
+  zonePolygon = [];
+  syncZonePolyField();
+  setZoneStatus('Polygon cleared. Click on the canvas to start again.');
+  drawZoneCanvas();
+}
+
+function reloadZoneSnapshot(){ onZoneCameraChange(); }
+
+// True while a real camera snapshot is loaded, so the canvas pixel coords
+// map 1:1 to the camera's frame. Drawing on a blank canvas saves a polygon
+// whose points don't correspond to anything on the live feed — the zone is
+// then misaligned in production. Gating the click handler + Create button
+// on this flag prevents that silent footgun.
+let zoneCanvasReady = false;
+function setZoneCanvasReady(ready){
+  zoneCanvasReady = !!ready;
+  const btn = $('zone-submit-btn');
+  if(btn) btn.disabled = !ready;
+  const canvas = $('zone-canvas');
+  if(canvas) canvas.style.cursor = ready ? 'crosshair' : 'not-allowed';
+}
+
+function onZoneCameraChange(){
+  const cameraId = $('f-zone-cam').value;
+  zoneSnapshot = null;
+  setZoneCanvasReady(false);
+  drawZoneCanvas();
+  if(!cameraId){
+    setZoneStatus('Select a camera to load its frame, then draw the zone polygon on the canvas.');
+    return;
+  }
+  const img = new Image();
+  img.onload = () => {
+    zoneSnapshot = img;
+    setZoneCanvasReady(true);
+    drawZoneCanvas();
+    setZoneStatus('Snapshot loaded. Click on the canvas to draw the zone polygon.');
+  };
+  img.onerror = () => {
+    zoneSnapshot = null;
+    setZoneCanvasReady(false);
+    drawZoneCanvas();
+    setZoneStatus('Snapshot unavailable for this camera — saving disabled. Verify the camera is streaming, then reload.');
+  };
+  img.src = `/api/cameras/${cameraId}/snapshot?t=${Date.now()}`;
+}
+
+function setWsBadge(connected){
+  const el = $('ws-badge');
+  el.className = 'ws-state ' + (connected ? 'ok' : 'err');
+  el.innerHTML = `<span class="live-dot"></span><span>${connected ? 'Live' : 'Offline'}</span>`;
+}
+
+function connectWS(){
+  ws = new WebSocket(`ws://${location.host}/ws/dashboard`);
+  ws.onopen = () => {
+    setWsBadge(true);
+    recordFeedMessage({type:'connected', endpoint:'/ws/dashboard'}, 'connected', 'socket');
+    sendWsTopics('subscribe', ['overview']);
+    fetch(API + '/api/zones').then(r => r.json()).then(zones => {
+      if(zones.length) sendWsTopics('subscribe', zones.map(z => 'zone:' + z.zone_id));
+    }).catch(() => {});
+  };
+  ws.onmessage = e => {
+    let msg;
+    try {
+      msg = JSON.parse(e.data);
+    } catch(err){
+      recordFeedMessage({type:'parse_error', raw:String(e.data).slice(0, 2000)}, 'parse_error', 'socket');
+      return;
+    }
+    recordFeedMessage(msg);
+    if(msg.type === 'overview') updateStats(msg.data);
+    else if(msg.type === 'zone_metric'){
+      mergeZoneRecord({zone_id: msg.zone_id, ...msg.data});
+      scheduleOverviewRender();
+    }
+    else if(msg.type === 'alert'){
+      const knownAlert = alertData.some(item => item.alert_id === msg.data?.alert_id)
+        || fullAlertData.some(item => item.alert_id === msg.data?.alert_id);
+      if(!knownAlert && msg.data && msg.data.acknowledged === false){
+        bumpUnackedAlerts(1);
+        updateStats({});
+        showAlertToast(msg.data);
+      }
+      alertData = mergeAlertItems(alertData, msg.data, 15);
+      renderAlerts();
+      if(alertMatchesPageFilter(msg.data)){
+        fullAlertData = mergeAlertItems(fullAlertData, msg.data, 50);
+      } else {
+        fullAlertData = fullAlertData.filter(item => item.alert_id !== msg.data.alert_id);
+      }
+      if(currentPage === 'alerts') renderAlertsFull();
+    }
+  };
+  ws.onclose = () => {
+    setWsBadge(false);
+    recordFeedMessage({type:'disconnected', endpoint:'/ws/dashboard'}, 'disconnected', 'socket');
+    setTimeout(connectWS, 3000);
+  };
+  ws.onerror = () => {
+    recordFeedMessage({type:'socket_error', endpoint:'/ws/dashboard'}, 'socket_error', 'socket');
+    ws.close();
+  };
+}
+
+function metricCard(label, value, color, note, opts){
+  const extraClass = opts && opts.extraClass ? ' ' + opts.extraClass : '';
+  const onclick = opts && opts.onclick ? ` onclick="${opts.onclick}"` : '';
+  return `
+    <div class="metric-card ${color}${extraClass}"${onclick}>
+      <div class="metric-label">${escapeHtml(label)}</div>
+      <div class="metric-value ${color}">${escapeHtml(value)}</div>
+      <div class="metric-note">${escapeHtml(note)}</div>
+    </div>
+  `;
+}
+
+// 21 zones publish at ~1Hz each, which would mean ~21 KPI/strip/grid rerenders
+// per second and visible jitter as totals tick up/down by 1 between zones.
+// Coalesce them into a single render every ~500ms; zoneData is still kept
+// fresh on every WS message so the next render reflects the latest state.
+let _overviewRenderPending = null;
+function scheduleOverviewRender(){
+  if(_overviewRenderPending != null) return;
+  _overviewRenderPending = setTimeout(() => {
+    _overviewRenderPending = null;
+    updateStats({});
+    renderThresholdSummary();
+  }, 500);
+}
+
+function updateStats(data){
+  overviewData = {...overviewData, ...(data || {})};
+  data = overviewData;
+  // KPIs are computed from the *logical* zones so a 4-feed group counts
+  // once toward "Near Capacity" / "Over Capacity" instead of four times.
+  // Total vehicles is still a sum (groups are summed too) so the headline
+  // number stays comparable across deployments.
+  const zones = buildLogicalZones();
+  const haveZones = zones.length > 0;
+  const totalVehicles = haveZones
+    ? zones.reduce((acc, z) => acc + Number(z.vehicle_count || 0), 0)
+    : (data.total_vehicles ?? 0);
+  // Match the "Busy" band exactly (yellow tiles on the Ramp Map): above
+  // 50% occupancy but still within the limit. Over-capacity zones get
+  // counted separately by the next card, so a zone never appears in both.
+  const nearCount = zones.filter(z => zoneOccupancyPct(z) > 50 && !_zoneCountOverCap(z)).length;
+  const overCap = haveZones
+    ? zones.filter(z => Number(z.vehicle_count || 0) > Number(z.max_vehicles || 0)).length
+    : (data.overcrowding_zones ?? 0);
+  const overstay = haveZones
+    ? zones.reduce((acc, z) => acc + Number(z.overstay_count || 0), 0)
+    : (data.total_overstay ?? 0);
+  const unacked = data.unacked_alerts ?? 0;
+  const cards = [
+    {label:'Total Vehicles', value:totalVehicles, color:'blue', note:'Vehicles detected across all active zones'},
+    {label:'Near Capacity', value:nearCount, color:(nearCount > 0 ? 'amber' : 'green'), note:'Zones above 50% but still within limit (yellow on map)'},
+    {label:'Over Capacity', value:overCap, color:(overCap > 0 ? 'red' : 'green'), note:'Zones at or above their vehicle threshold'},
+    {label:'Overstay', value:overstay, color:(overstay > 0 ? 'amber' : 'green'), note:'Vehicles exceeding dwell threshold'},
+    {label:'Unacknowledged Alerts', value:unacked, color:(unacked > 0 ? 'red' : 'green'), note:'Click to review · awaiting acknowledgement',
+     extraClass:'kpi-primary clickable',
+     onclick:"navigateToPage('alerts'); return false;"}
+  ];
+  $('stat-cards').innerHTML = cards.map(card => metricCard(card.label, card.value, card.color, card.note, card)).join('');
+  syncBellBadge();
+}
+
+// Three mutually-exclusive pressure bands surfaced in the overview strip.
+// Definitions are aligned with the alert engine and KPI cards so the same
+// "Over Capacity" word means the same thing in every section:
+//   Calm:           occupancy <= 50%
+//   Busy:           occupancy > 50% AND count <= capacity (busy but within limit)
+//   Over capacity:  count > capacity strictly (matches alert engine + KPI)
+function _zoneCountOverCap(z){
+  return Number(z?.vehicle_count || 0) > Number(z?.max_vehicles || 0);
+}
+const OCCUPANCY_BANDS = [
+  {key:'calm', label:'Calm',          range:'≤50%',          tone:'green', test: z => zoneOccupancyPct(z) <= 50 && !_zoneCountOverCap(z)},
+  {key:'busy', label:'Busy',          range:'>50% to limit', tone:'amber', test: z => zoneOccupancyPct(z) > 50 && !_zoneCountOverCap(z)},
+  {key:'over', label:'Over capacity', range:'over limit',    tone:'red',   test: z => _zoneCountOverCap(z)},
+];
+
+// Collapse zoneData into "logical zones" — one entry per group (member
+// camera-zones summed) plus pass-through entries for ungrouped zones.
+// Operators ask "how many cars in Zone 5?", not "how many in cam_143's
+// view of Zone 5?", so the Overview shows the logical answer and the
+// per-camera breakdown lives on the Live View / Zones pages.
+function buildLogicalZones(){
+  const standalone = [];
+  const groups = new Map();  // group_id → accumulator
+  for(const z of Object.values(zoneData)){
+    const gid = z.zone_group_id;
+    if(!gid){
+      standalone.push(z);
+      continue;
+    }
+    let acc = groups.get(gid);
+    if(!acc){
+      acc = {
+        // Use group_id as the synthetic zone_id so renderers that key on
+        // zone_id (sorting, the hotspot-id set) still work unchanged.
+        zone_id: gid,
+        name: z.group_name || gid,
+        camera_id: null,  // populated below as "N feeds"
+        vehicle_count: 0,
+        // Group's max_vehicles is the threshold the operator set on the
+        // group itself — independent of any single member camera's
+        // max_vehicles, which was an unrelated per-feed setting.
+        max_vehicles: Number(z.group_max_vehicles || 0),
+        overstay_count: 0,
+        max_dwell_time_s: 0,
+        _avg_weighted: 0,
+        _avg_total_weight: 0,
+        _members: [],
+        _is_group: true,
+      };
+      groups.set(gid, acc);
+    }
+    const vc = Number(z.vehicle_count || 0);
+    acc.vehicle_count += vc;
+    acc.overstay_count += Number(z.overstay_count || 0);
+    const md = Number(z.max_dwell_time_s || 0);
+    if(md > acc.max_dwell_time_s) acc.max_dwell_time_s = md;
+    // Vehicle-weighted average across members
+    acc._avg_weighted += Number(z.avg_dwell_time_s || 0) * vc;
+    acc._avg_total_weight += vc;
+    acc._members.push(z);
+  }
+  for(const acc of groups.values()){
+    acc.avg_dwell_time_s = acc._avg_total_weight > 0
+      ? acc._avg_weighted / acc._avg_total_weight
+      : 0;
+    delete acc._avg_weighted;
+    delete acc._avg_total_weight;
+    const n = acc._members.length;
+    acc.camera_id = `${n} feed${n === 1 ? '' : 's'}`;
+  }
+  return [...standalone, ...groups.values()];
+}
+
+// Pixel positions (in % of the 1561×429 floor-plan image) where each
+// zone overlay should sit. Keyed by the logical-zone DISPLAY NAME
+// (zone_groups.name for grouped zones; zones.name for standalones) since
+// the user confirmed those match the on-image "ZONE-N" labels.
+//
+// Image layout: top row labels go 6→5→4→3→2→1 left-to-right;
+// bottom row labels go 7→8→9→10→11→12 left-to-right. Every entry
+// here renders an overlay — entries without a matching DB zone show
+// up as a gray placeholder so the operator sees the full floor plan,
+// not gaps where unmonitored zones sit.
+const ZONE_MAP_POSITIONS = {
+  // Top row
+  'Zone 6':  { left: 10, top: 22 },
+  'Zone 5':  { left: 31, top: 22 },
+  'Zone 4':  { left: 51, top: 22 },
+  'Zone 3':  { left: 70, top: 22 },
+  'Zone 2':  { left: 85, top: 22 },
+  'Zone 1':  { left: 97, top: 22 },
+  // Bottom row
+  'Zone 7':  { left: 12, top: 66 },
+  'Zone 8':  { left: 27, top: 66 },
+  'Zone 9':  { left: 47, top: 66 },
+  'Zone 10': { left: 64, top: 66 },
+  'Zone 11': { left: 79, top: 66 },
+  'Zone 12': { left: 93, top: 66 },
+};
+
+function renderThresholdSummary(){
+  const el = $('overview-summary');
+  const sub = $('overview-summary-sub');
+  if(!el || !sub) return;
+
+  const zones = buildLogicalZones();
+  sub.textContent = 'Live vehicle counts overlaid on the arrival ramp floor plan.';
+  if(!zones.length){
+    el.innerHTML = '<div class="empty" style="position:absolute;inset:0;display:grid;place-items:center">No zones yet.</div>';
+    return;
+  }
+
+  // Map DB zones by their display name so we can look them up while
+  // iterating ZONE_MAP_POSITIONS (every image-zone gets an overlay,
+  // with a gray placeholder for ones we don't monitor).
+  const byName = new Map();
+  for(const z of zones) byName.set(z.name || z.zone_id, z);
+
+  const overlays = [];
+  for(const [key, pos] of Object.entries(ZONE_MAP_POSITIONS)){
+    const zone = byName.get(key);
+    if(!zone){
+      // Image has a zone here but no DB row monitors it. Draw a
+      // muted placeholder so the floor plan stays visually complete.
+      overlays.push(`
+        <div class="zone-overlay muted" style="left:${pos.left}%;top:${pos.top}%"
+             title="${escapeHtml(key)}: not monitored">
+          <div class="zo-name">${escapeHtml(key)}</div>
+          <div class="zo-count zo-na">—</div>
+        </div>
+      `);
+      continue;
+    }
+    const count = parseInt(zone.vehicle_count || 0, 10);
+    const max = parseInt(zone.max_vehicles || 0, 10);
+    const pct = Math.min(999, zoneOccupancyPct(zone));
+    const matchedBand = OCCUPANCY_BANDS.find(b => b.test(zone));
+    const tone = matchedBand ? matchedBand.tone : occupancyTone(pct);
+    const barWidth = Math.max(0, Math.min(pct, 100));
+    overlays.push(`
+      <div class="zone-overlay ${tone}" style="left:${pos.left}%;top:${pos.top}%"
+           title="${escapeHtml(key)}: ${count}/${max || '—'} (${pct.toFixed(0)}%)">
+        <div class="zo-name">${escapeHtml(key)}</div>
+        <div class="zo-count">${count}<span class="zo-max"> / ${escapeHtml(max || '—')}</span></div>
+        <div class="zo-bar"><div style="width:${barWidth}%"></div></div>
+      </div>
+    `);
+  }
+  el.innerHTML = overlays.join('') || '<div class="empty" style="position:absolute;inset:0;display:grid;place-items:center">No zones mapped to the floor plan.</div>';
+}
+
+function alertImageBadge(alert){
+  if(!alert || !alert.image_url) return '';
+  const url = String(alert.image_url);
+  const tip = alert.alert_type === 'overstay'
+    ? 'Open evidence photo of vehicle (new tab)'
+    : 'Open frame snapshot (new tab)';
+  return `<a class="alert-img-btn" href="${escapeHtml(url)}" target="_blank" rel="noopener" title="${escapeHtml(tip)}" aria-label="${escapeHtml(tip)}" onclick="event.stopPropagation()">View image</a>`;
+}
+
+function renderAlerts(){
+  const el = $('alert-list');
+  const items = alertData.slice(0, 15);
+  if(!items.length){
+    el.innerHTML = '<div class="empty">No alerts</div>';
+    return;
+  }
+  el.innerHTML = items.map(alert => `
+    <div class="alert-item">
+      <span class="alert-badge ${escapeHtml(alert.level || 'warning')}">${escapeHtml(alert.level || 'warning')}</span>
+      <div style="flex:1;min-width:0">
+        <div class="alert-msg-row">
+          <div class="alert-msg" title="${escapeHtml(alert.message || '')}">${escapeHtml(alertHeadline(alert))}</div>
+          ${alertImageBadge(alert)}
+        </div>
+        <div class="alert-meta">${escapeHtml(alert.alert_type || 'event')} · ${escapeHtml(fmtTime(alert.ts))}</div>
+      </div>
+    </div>
+  `).join('');
+}
+
+const SEVERITY_RANK = {critical: 0, warning: 1, info: 2};
+
+function fmtRelativeTime(ts){
+  if(!ts) return '';
+  const ms = typeof ts === 'number' ? ts * 1000 : new Date(ts).getTime();
+  const diffSec = Math.floor((Date.now() - ms) / 1000);
+  if(diffSec < 60) return `${Math.max(1, diffSec)}s ago`;
+  if(diffSec < 3600) return `${Math.floor(diffSec / 60)}m ago`;
+  if(diffSec < 86400) return `${Math.floor(diffSec / 3600)}h ago`;
+  if(diffSec < 7 * 86400) return `${Math.floor(diffSec / 86400)}d ago`;
+  return new Date(ms).toLocaleDateString([], {month:'short', day:'numeric'});
+}
+
+// Build the zone-filter dropdown options keyed by *display label* (e.g.
+// "Zone 5"). A multi-camera group has many zone_ids that all display as
+// the same label, and the operator thinks in labels — picking "Zone 5"
+// once should catch every member-camera's alerts and any group-level
+// overcrowding alert.
+//
+// Options come from zoneData only (so labels are always the friendly
+// names the operator configured). Stale zone_ids like "arrival_zone_1"
+// are filtered out — those happen when a zone has no proper name and the
+// label-resolver falls back to the id; they don't help an operator pick.
+function renderAlertZoneOptions(){
+  const sel = $('alert-zone-filter');
+  if(!sel) return;
+  const labels = new Set();
+  for(const z of Object.values(zoneData)){
+    const label = z.group_name || z.name;
+    if(!label) continue;
+    if(label === z.zone_id) continue;  // fallback-to-id, not a real label
+    labels.add(label);
+  }
+  const opts = [...labels]
+    .sort((a, b) => String(a).localeCompare(String(b), undefined, {numeric:true}));
+  const html = '<option value="">All zones</option>'
+    + opts.map(label =>
+        `<option value="${escapeHtml(label)}">${escapeHtml(label)}</option>`
+      ).join('');
+  if(sel.dataset.signature !== html){
+    const prev = sel.value;
+    sel.innerHTML = html;
+    sel.dataset.signature = html;
+    if([...sel.options].some(o => o.value === prev)) sel.value = prev;
+  }
+}
+
+function setAlertsPage(idx){
+  alertsPageIndex = Math.max(0, idx | 0);
+  renderAlertsFull();
+  // Scroll the page area back to the top after a page change so the operator
+  // doesn't have to scroll up manually to see the new page's first row.
+  const scroller = $('alerts-full')?.closest('.scroll');
+  if(scroller) scroller.scrollTop = 0;
+}
+
+function onAlertsPerPageChange(){
+  const sel = $('alerts-per-page');
+  const val = sel ? parseInt(sel.value, 10) : 50;
+  alertsPerPage = (val > 0 ? val : 50);
+  alertsPageIndex = 0;
+  renderAlertsFull();
+}
+
+function getAlertsPageVisible(){
+  const q = ($('alerts-search')?.value || '').trim().toLowerCase();
+  const sev = $('alert-severity-filter')?.value || '';
+  const zoneSel = $('alert-zone-filter')?.value || '';
+  return fullAlertData
+    .filter(a => !sev || (a.level || 'warning') === sev)
+    .filter(a => !zoneSel || alertZoneLabel(a.zone_id) === zoneSel)
+    .filter(a => {
+      if(!q) return true;
+      return [a.message, a.zone_id, a.camera_id, a.track_id != null ? '#' + a.track_id : '']
+        .filter(Boolean)
+        .some(s => String(s).toLowerCase().includes(q));
+    })
+    .sort((a, b) => {
+      // Default order is newest-first. Severity-first ordering is only applied
+      // when the operator has explicitly picked a severity from the dropdown;
+      // otherwise an old critical alert would always sit above a brand-new
+      // warning, which obscures what's happening right now.
+      if(sev){
+        const sa = SEVERITY_RANK[a.level || 'warning'] ?? 3;
+        const sb = SEVERITY_RANK[b.level || 'warning'] ?? 3;
+        if(sa !== sb) return sa - sb;
+      }
+      const tsa = typeof a.ts === 'number' ? a.ts : new Date(a.ts).getTime() / 1000;
+      const tsb = typeof b.ts === 'number' ? b.ts : new Date(b.ts).getTime() / 1000;
+      return tsb - tsa;
+    });
+}
+
+function renderAlertsFull(){
+  const el = $('alerts-full');
+  if(!el) return;
+  renderAlertZoneOptions();
+
+  // Stats reflect the FULL fetched set (not the search-filtered view), so the
+  // operator always sees true severity counts at the top.
+  // Prefer server-supplied counts (survive reload, reflect the full DB
+  // matching the zone/type filter, ignore unacked-only). Fall back to
+  // deriving from fullAlertData if the server response is the legacy flat
+  // array (e.g. against an older cloud).
+  const total = fullAlertCounts?.total ?? fullAlertData.length;
+  const critical = fullAlertCounts?.critical ?? fullAlertData.filter(a => a.level === 'critical').length;
+  const warning = fullAlertCounts?.warning ?? fullAlertData.filter(a => a.level === 'warning').length;
+  const acked = fullAlertCounts?.acknowledged ?? fullAlertData.filter(a => a.acknowledged).length;
+
+  const statsEl = $('alerts-stats');
+  if(statsEl){
+    const cards = [
+      {label:'Critical',     value:critical, tone:critical > 0 ? 'red' : 'slate'},
+      {label:'Warning',      value:warning,  tone:warning > 0 ? 'amber' : 'slate'},
+      {label:'Acked today',  value:acked,    tone:'green'},
+      {label:'Total in view',value:total,    tone:'slate'},
+    ];
+    statsEl.innerHTML = cards.map(c => `
+      <div class="alerts-stat ${c.tone}">
+        <div class="alerts-stat-label">${escapeHtml(c.label)}</div>
+        <div class="alerts-stat-value ${c.tone}">${c.value}</div>
+      </div>
+    `).join('');
+  }
+
+  const visible = getAlertsPageVisible();
+  const ackable = visible.filter(a => !a.acknowledged && a.alert_id != null);
+  const ackBtn = $('alerts-ack-all-btn');
+  if(ackBtn){
+    ackBtn.disabled = ackable.length === 0;
+    ackBtn.textContent = ackable.length
+      ? `Acknowledge all visible (${ackable.length})`
+      : 'Nothing to acknowledge';
+  }
+
+  const pagerEl = $('alerts-pager');
+  if(!visible.length){
+    el.innerHTML = total
+      ? '<div class="empty">No alerts match the current filters.</div>'
+      : '<div class="empty">No alerts to show.</div>';
+    if(pagerEl) pagerEl.innerHTML = '';
+    return;
+  }
+
+  // Slice the filtered+sorted list into the current page. Clamp the index
+  // so a WS update that shrinks the list (e.g. ack removed the last item
+  // on the last page) doesn't leave us looking at nothing.
+  const totalPages = Math.max(1, Math.ceil(visible.length / alertsPerPage));
+  if(alertsPageIndex >= totalPages) alertsPageIndex = totalPages - 1;
+  if(alertsPageIndex < 0) alertsPageIndex = 0;
+  const start = alertsPageIndex * alertsPerPage;
+  const pageItems = visible.slice(start, start + alertsPerPage);
+
+  if(pagerEl){
+    if(totalPages > 1){
+      const from = start + 1;
+      const to = start + pageItems.length;
+      pagerEl.innerHTML = `<span class="pager-info">Showing ${from}–${to} of ${visible.length}</span>`
+        + renderPageButtons(alertsPageIndex + 1, totalPages, 'setAlertsPage');
+    } else {
+      pagerEl.innerHTML = '';
+    }
+  }
+
+  el.innerHTML = pageItems.map(alert => {
+    const level = alert.level || 'warning';
+    const acked = Boolean(alert.acknowledged);
+    const cls = ['alert-item', level];
+    if(acked) cls.push('acknowledged');
+    const chips = [];
+    if(alert.zone_id) chips.push(`<span class="alert-chip zone" title="Zone (${escapeHtml(alert.zone_id)})">${escapeHtml(alertZoneLabel(alert.zone_id))}</span>`);
+    if(alert.track_id != null) chips.push(`<span class="alert-chip vehicle" title="Vehicle id">vehicle #${escapeHtml(alert.track_id)}</span>`);
+    // Overstay alerts only: show when the vehicle entered the zone.
+    // arrival = alert.ts - alert.dwell_time_s (both authoritative on the edge).
+    if(alert.dwell_time_s != null && alert.ts != null){
+      const tsSecs = typeof alert.ts === 'number' ? alert.ts : new Date(alert.ts).getTime() / 1000;
+      const arrivedAt = new Date((tsSecs - Number(alert.dwell_time_s)) * 1000);
+      const sameDay = arrivedAt.toDateString() === new Date().toDateString();
+      const shortStr = sameDay
+        ? arrivedAt.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})
+        : arrivedAt.toLocaleString([], {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'});
+      chips.push(`<span class="alert-chip" title="Vehicle entered zone at ${escapeHtml(arrivedAt.toLocaleString())}">arrived ${escapeHtml(shortStr)}</span>`);
+    }
+    // Camera (look at evidence) lives next to the message — it's *context*
+    // about this alert. The ✓ button (close it) is the row's terminus —
+    // *action* on this alert. When already acked, the action slot collapses
+    // and the acked-by status appears inline with the chips.
+    const ackButton = acked
+      ? ''
+      : `<button class="alert-ack-btn" title="Acknowledge alert" aria-label="Acknowledge alert" onclick="ackAlert(${alert.alert_id})">Acknowledge</button>`;
+    const ackedStatus = acked
+      ? `<span class="alert-ack-state" title="Acknowledged${alert.acked_by ? ' by ' + escapeHtml(alert.acked_by) : ''}">✓ Acknowledged${alert.acked_by ? ' by ' + escapeHtml(alert.acked_by) : ''}</span>`
+      : '';
+    return `
+      <div class="${cls.join(' ')}">
+        <span class="alert-badge ${level}">${escapeHtml(level)}</span>
+        <div style="flex:1;min-width:0">
+          <div class="alert-msg-row">
+            <div class="alert-msg" title="${escapeHtml(alert.message || '')}">${escapeHtml(alertHeadline(alert))}</div>
+            ${alertImageBadge(alert)}
+          </div>
+          <div class="alert-meta">
+            <span class="alert-time" title="${escapeHtml(new Date((typeof alert.ts === 'number' ? alert.ts * 1000 : alert.ts)).toLocaleString())}">${escapeHtml(fmtRelativeTime(alert.ts))}</span>
+            ${chips.join('')}
+            ${ackedStatus}
+          </div>
+        </div>
+        ${ackButton}
+      </div>
+    `;
+  }).join('');
+}
+
+async function ackAllVisible(){
+  const visible = getAlertsPageVisible().filter(a => !a.acknowledged && a.alert_id != null);
+  if(!visible.length) return;
+  const ackBtn = $('alerts-ack-all-btn');
+  if(ackBtn) ackBtn.disabled = true;
+  // Fire ack requests in parallel; the existing ackAlert handler already
+  // updates state and re-renders, so skip its post-hoc renders by inlining
+  // a lighter request and a single render at the end.
+  const ids = visible.map(a => a.alert_id);
+  await Promise.all(ids.map(id => fetch(API + '/api/alerts/' + id + '/acknowledge', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}',
+  }).catch(() => {})));
+  fullAlertData = fullAlertData.map(a =>
+    ids.includes(a.alert_id) ? {...a, acknowledged: true, acked_by: 'operator'} : a
+  );
+  alertData = alertData.map(a =>
+    ids.includes(a.alert_id) ? {...a, acknowledged: true, acked_by: 'operator'} : a
+  );
+  // Decrement the global unacked counter by however many we just acked.
+  bumpUnackedAlerts(-ids.length);
+  updateStats({});
+  renderAlerts();
+  renderAlertsFull();
+  // Refresh the server-side stat counts so the "Acknowledged" card ticks
+  // up immediately (matches single-ack behavior).
+  fetchAlertsFull();
+}
+
+let analyticsRange = '24h';
+let analyticsType = 'overcrowding';
+let analyticsZoneFilter = '';             // empty = all zones
+let analyticsVehiclesPage = 0;
+let analyticsZonesPage    = 0;
+const ANALYTICS_VEHICLES_PAGE_SIZE = 10;
+const ANALYTICS_ZONES_PAGE_SIZE    = 10;
+
+const ANALYTICS_TYPE_LABELS = {
+  overcrowding: 'Zones exceeding capacity',
+  overstay: 'Vehicles overstaying',
+};
+// Bars in either chart count rows in `vehicle_alerts`, so the unit on the
+// Y-axis and the total is always "alert(s)". The chart title above tells the
+// operator *which kind* of alert (zones over capacity vs vehicles overstaying).
+const ANALYTICS_UNIT = {unit: 'alert', plural: 'alerts'};
+
+function setAnalyticsRange(range){
+  analyticsRange = range;
+  analyticsVehiclesPage = 0;
+  analyticsZonesPage = 0;
+  analyticsZoneFilter = '';
+  document.querySelectorAll('#analytics-range-row .analytics-pill').forEach(btn => {
+    btn.classList.toggle('is-active', btn.dataset.range === range);
+  });
+  fetchAnalytics();
+}
+
+function setAnalyticsType(type){
+  analyticsType = type;
+  analyticsVehiclesPage = 0;
+  analyticsZonesPage = 0;
+  analyticsZoneFilter = '';
+  document.querySelectorAll('#analytics-type-row .analytics-pill').forEach(btn => {
+    btn.classList.toggle('is-active', btn.dataset.type === type);
+  });
+  fetchAnalytics();
+}
+
+function setAnalyticsVehiclesPage(page){
+  analyticsVehiclesPage = Math.max(0, page);
+  fetchAnalytics();
+}
+
+function setAnalyticsZonesPage(page){
+  analyticsZonesPage = Math.max(0, page);
+  fetchAnalytics();
+}
+
+function setAnalyticsZoneFilter(zoneId){
+  analyticsZoneFilter = zoneId || '';
+  // Reset both paginators since the filtered set is different.
+  analyticsVehiclesPage = 0;
+  analyticsZonesPage = 0;
+  fetchAnalytics();
+}
+
+function fetchAnalytics(){
+  let tz = 'UTC';
+  try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; } catch(_) {}
+  const vOffset = analyticsVehiclesPage * ANALYTICS_VEHICLES_PAGE_SIZE;
+  const zOffset = analyticsZonesPage    * ANALYTICS_ZONES_PAGE_SIZE;
+  let url = `${API}/api/analytics/alerts?range=${encodeURIComponent(analyticsRange)}&type=${encodeURIComponent(analyticsType)}&tz=${encodeURIComponent(tz)}`
+    + `&vehicles_offset=${vOffset}&vehicles_limit=${ANALYTICS_VEHICLES_PAGE_SIZE}`
+    + `&zones_offset=${zOffset}&zones_limit=${ANALYTICS_ZONES_PAGE_SIZE}`;
+  if(analyticsZoneFilter){
+    url += `&zone_id=${encodeURIComponent(analyticsZoneFilter)}`;
+  }
+  $('analytics-chart').innerHTML = '<div class="empty">Loading…</div>';
+  $('analytics-top-zones').innerHTML = '<div class="empty">Loading…</div>';
+  fetch(url).then(r => r.json()).then(renderAnalytics).catch(err => {
+    $('analytics-chart').innerHTML = `<div class="empty">Failed to load analytics: ${escapeHtml(String(err))}</div>`;
+  });
+}
+
+function niceScale(peak, targetTicks=5){
+  // Round the chart's max up to a "nice" number (1, 2, 5 × 10^N) so axis
+  // ticks read cleanly. Returns {max, step, ticks: [0, step, ..., max]}.
+  if(!isFinite(peak) || peak <= 0) return {max: 1, step: 1, ticks: [0, 1]};
+  const rawStep = peak / targetTicks;
+  const mag = Math.pow(10, Math.floor(Math.log10(rawStep)));
+  const norm = rawStep / mag;
+  const niceMul = norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 5 ? 5 : 10;
+  const step = niceMul * mag;
+  const max = Math.ceil(peak / step) * step;
+  const ticks = [];
+  for(let v = 0; v <= max + 1e-9; v += step) ticks.push(Math.round(v * 1e6) / 1e6);
+  return {max, step, ticks};
+}
+
+// Numbered pager. Always shows page 1 and last page; the current page is in
+// the middle, padded by 1 neighbor each side; ellipses fill the gaps. With
+// >=7 pages the rendered set has at most ~7 buttons, so the row stays short.
+// onClickFn is the JS function name to call on click (it receives page-1 as
+// its argument, e.g. setAnalyticsVehiclesPage or setAnalyticsZonesPage).
+function renderPageButtons(current, totalPages, onClickFn){
+  if(totalPages <= 1) return '';
+  const pages = new Set([1, totalPages, current, current - 1, current + 1]);
+  const seq = [...pages].filter(p => p >= 1 && p <= totalPages).sort((a, b) => a - b);
+  const out = [];
+  for(let i = 0; i < seq.length; i++){
+    if(i > 0 && seq[i] - seq[i - 1] > 1){
+      out.push(`<span class="analytics-pgnum gap">…</span>`);
+    }
+    const p = seq[i];
+    const cls = p === current ? 'analytics-pgnum is-active' : 'analytics-pgnum';
+    const onclick = p === current ? '' : `onclick="${onClickFn}(${p - 1})"`;
+    out.push(`<button type="button" class="${cls}" ${onclick}>${p}</button>`);
+  }
+  return out.join('');
+}
+
+// Populate the zone-filter dropdown options + sync the chart-title chip with
+// the active filter. Runs on every analytics render.
+function renderAnalyticsFilterUI(data){
+  const opts = Array.isArray(data.zones_with_alerts) ? data.zones_with_alerts : [];
+  const sel = $('analytics-zone-filter');
+  if(sel){
+    if(opts.length){
+      const optionsHtml = ['<option value="">All zones</option>']
+        .concat(opts.map(z => `<option value="${escapeHtml(z.zone_id)}">${escapeHtml(z.zone_name || z.zone_id)}</option>`))
+        .join('');
+      // Only re-write innerHTML if option set changed (avoids flicker).
+      const desired = optionsHtml;
+      if(sel.dataset.signature !== desired){
+        sel.innerHTML = desired;
+        sel.dataset.signature = desired;
+      }
+      sel.value = analyticsZoneFilter || '';
+      sel.hidden = false;
+    } else {
+      sel.innerHTML = '';
+      sel.dataset.signature = '';
+      sel.hidden = true;
+    }
+  }
+
+  const chip = $('analytics-filter-chip');
+  if(chip){
+    if(analyticsZoneFilter){
+      const match = opts.find(z => z.zone_id === analyticsZoneFilter);
+      const name = match ? (match.zone_name || match.zone_id) : analyticsZoneFilter;
+      chip.hidden = false;
+      chip.innerHTML = `Filtered: ${escapeHtml(name)} <button type="button" class="analytics-filter-chip-x" onclick="setAnalyticsZoneFilter('')" aria-label="Clear filter">✕</button>`;
+    } else {
+      chip.hidden = true;
+      chip.innerHTML = '';
+    }
+  }
+}
+
+function renderAnalytics(data){
+  const buckets = data.buckets || [];
+  const total = Number(data.total || 0);
+  const granularity = data.granularity || 'hour';
+
+  const unit = ANALYTICS_UNIT;
+  $('analytics-chart-title').textContent = ANALYTICS_TYPE_LABELS[data.type] || 'Alert events';
+  $('analytics-total').innerHTML = `${total}<span class="analytics-total-unit"> ${total === 1 ? unit.unit : unit.plural}</span>`;
+  renderAnalyticsFilterUI(data);
+  const xUnit = granularity === '10min' ? '10 min' : (granularity === 'hour' ? 'hour' : 'day');
+
+  const chartEl = $('analytics-chart');
+  if(!buckets.length){
+    chartEl.innerHTML = '<div class="empty">No data in this window.</div>';
+    return;
+  }
+  const peak = Math.max(0, ...buckets.map(b => Number(b.count || 0)));
+  const scale = niceScale(peak);
+  const yAxisHtml = scale.ticks.map(v => {
+    const pos = (v / scale.max) * 100;
+    return `<span class="analytics-ytick" style="bottom:${pos}%">${v}</span>`;
+  }).join('');
+  const gridHtml = scale.ticks.map((v, idx) => {
+    const pos = (v / scale.max) * 100;
+    const cls = idx === 0 ? 'analytics-gridline baseline' : 'analytics-gridline';
+    return `<div class="${cls}" style="bottom:${pos}%"></div>`;
+  }).join('');
+  // When bars are too narrow to fit horizontal labels, rotate the labels -45°
+  // so every bucket stays labelled. 24 hourly buckets still fit horizontally;
+  // 30 daily buckets do not.
+  const rotateLabels = buckets.length > 24;
+  const barsHtml = buckets.map(b => {
+    const count = Number(b.count || 0);
+    const pct = scale.max > 0 ? (count / scale.max) * 100 : 0;
+    // Single colour for all non-zero bars. The bar height already encodes
+    // magnitude; the prior red-for-top-third / amber-for-rest split used a
+    // relative threshold (peak * 0.66) which made a 2-alert quiet day look as
+    // alarming as a 200-alert spike, and conflated "tallest bar in view" with
+    // "critical" — red has semantic weight that didn't correspond to anything.
+    const tone = count === 0 ? 'zero' : 'amber';
+    const valueLabel = count > 0 ? `<span class="analytics-bar-value">${count}</span>` : '';
+    return `
+      <div class="analytics-bar-cell" title="${escapeHtml(b.label)}: ${count} ${count === 1 ? unit.unit : unit.plural}">
+        <div class="analytics-bar-track">
+          <div class="analytics-bar-fill ${tone}" style="height:${pct.toFixed(1)}%">${valueLabel}</div>
+        </div>
+        <div class="analytics-bar-label">${escapeHtml(b.label)}</div>
+      </div>
+    `;
+  }).join('');
+  chartEl.classList.toggle('rotate-labels', rotateLabels);
+  chartEl.innerHTML = `
+    <div class="analytics-yaxis">
+      <span class="analytics-yaxis-title">${escapeHtml(unit.plural)}</span>
+      <div class="analytics-yaxis-inner">${yAxisHtml}</div>
+    </div>
+    <div class="analytics-plot">
+      <div class="analytics-gridlines">${gridHtml}</div>
+      <div class="analytics-bars">${barsHtml}</div>
+    </div>
+    <div class="analytics-xaxis-title">${escapeHtml(xUnit)}</div>
+  `;
+
+  const titleEl = $('analytics-top-title');
+  const subEl = $('analytics-top-sub');
+  const topEl = $('analytics-top-zones');
+  const pagerEl = $('analytics-top-pager');
+  if(data.type === 'overstay'){
+    if(titleEl) titleEl.textContent = 'Top wait times';
+    const total = Number(data.vehicles_total || 0);
+    const limit = Number(data.vehicles_limit || ANALYTICS_VEHICLES_PAGE_SIZE);
+    const offset = Number(data.vehicles_offset || 0);
+    const totalPages = Math.max(1, Math.ceil(total / limit));
+    const currentPage = Math.floor(offset / limit) + 1;
+    if(subEl){
+      subEl.textContent = total
+        ? `${total} vehicle${total === 1 ? '' : 's'} sorted by longest dwell.`
+        : 'Vehicles with the longest dwell in the selected window.';
+    }
+    if(pagerEl){
+      pagerEl.innerHTML = totalPages > 1 ? renderPageButtons(currentPage, totalPages, 'setAnalyticsVehiclesPage') : '';
+    }
+    const items = data.top_vehicles || [];
+    if(!items.length){
+      topEl.innerHTML = '<div class="empty">No vehicles overstayed in this window.</div>';
+    } else {
+      topEl.innerHTML = items.map((v, i) => {
+        // Suppress the bare track_id — IDs are recycled (the same #4 can be
+        // many physical vehicles over a long window). Lead with the zone +
+        // alert timestamp so each row reads as a single peak event, and
+        // include the camera_id since one zone often has multiple cameras.
+        const zoneTxt = escapeHtml(v.zone_name || v.zone_id || '—');
+        const tsTxt = v.ts ? fmtDateTime(v.ts) : '';
+        const camTxt = v.camera_id ? escapeHtml(v.camera_id) : '';
+        const metaParts = [camTxt, tsTxt].filter(Boolean);
+        const meta = metaParts.length ? metaParts.join(' · ') : '—';
+        const imgBtn = v.image_url
+          ? `<a class="alert-img-btn" href="${escapeHtml(v.image_url)}" target="_blank" rel="noopener" title="Open evidence photo (new tab)" onclick="event.stopPropagation()">View image</a>`
+          : '';
+        return `
+          <div class="analytics-top-row">
+            <div style="min-width:0">
+              <div class="analytics-top-name">${offset + i + 1}. ${zoneTxt}</div>
+              <div class="analytics-top-meta">${meta}</div>
+            </div>
+            <div style="display:flex;align-items:center;gap:10px;flex-shrink:0">
+              ${imgBtn}
+              <div class="analytics-top-count">${escapeHtml(fmtDuration(v.dwell_time_s || 0))}</div>
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+  } else {
+    if(titleEl) titleEl.textContent = 'Top zones';
+    const zTotal  = Number(data.zones_total  || 0);
+    const zLimit  = Number(data.zones_limit  || ANALYTICS_ZONES_PAGE_SIZE);
+    const zOffset = Number(data.zones_offset || 0);
+    const zTotalPages = Math.max(1, Math.ceil(zTotal / zLimit));
+    const zCurrentPage = Math.floor(zOffset / zLimit) + 1;
+    if(subEl){
+      subEl.textContent = zTotal
+        ? `${zTotal} zone${zTotal === 1 ? '' : 's'} sorted by alert count.`
+        : 'Highest alert volume in the selected window.';
+    }
+    if(pagerEl){
+      pagerEl.innerHTML = zTotalPages > 1 ? renderPageButtons(zCurrentPage, zTotalPages, 'setAnalyticsZonesPage') : '';
+    }
+    const items = data.top_zones || [];
+    // Use the chart's grand total for percent so each row's % reflects share
+    // of *all* alerts in the window, not just the visible page.
+    const grandTotal = Number(data.total || 0);
+    if(!items.length){
+      topEl.innerHTML = '<div class="empty">No zones triggered alerts in this window.</div>';
+    } else {
+      topEl.innerHTML = items.map((z, i) => {
+        const count = Number(z.count || 0);
+        const pct = grandTotal > 0 ? Math.round((count / grandTotal) * 100) : 0;
+        const safeZid = escapeHtml(z.zone_id);
+        return `
+          <div class="analytics-top-row clickable" onclick="setAnalyticsZoneFilter('${safeZid}')" title="Filter chart to this zone">
+            <div style="min-width:0">
+              <div class="analytics-top-name">${zOffset + i + 1}. ${escapeHtml(z.zone_name || z.zone_id)}</div>
+              <div class="analytics-top-meta">${safeZid} · ${pct}% of total</div>
+            </div>
+            <div class="analytics-top-count">${count}</div>
+          </div>
+        `;
+      }).join('');
+    }
+  }
+}
+
+function fetchAll(){
+  fetch(API + '/api/overview').then(r => r.json()).then(data => {
+    lastOverview = data;
+    updateStats(data);
+    const nextZoneData = {};
+    if(data.zones) data.zones.forEach(z => {
+      nextZoneData[z.zone_id] = {...(zoneData[z.zone_id] || {}), ...z};
+    });
+    zoneData = nextZoneData;
+    renderThresholdSummary();
+    if(currentPage === 'live') renderLiveSidebar();
+  }).catch(() => {});
+  fetch(API + '/api/alerts?limit=15').then(r => r.json()).then(data => {
+    // New shape: {alerts, counts}. Old code expected a flat array, so
+    // accept either: if the response is an object with .alerts, unpack it;
+    // otherwise treat the whole thing as the array (graceful during rollout).
+    alertData = Array.isArray(data) ? data : (data && data.alerts) || [];
+    renderAlerts();
+  }).catch(() => {});
+}
+
+function fetchCameras(){
+  fetch(API + '/api/cameras').then(r => r.json()).then(cams => {
+    const el = $('cam-table');
+    if(!cams.length){
+      el.innerHTML = '<tr><td colspan="6" class="empty">No cameras configured. Use “Add Camera” to attach a new RTSP source.</td></tr>';
+      return;
+    }
+    el.innerHTML = cams.map(cam => {
+      const res = (cam.width && cam.height) ? `${cam.width}×${cam.height}` : '—';
+      const fps = (cam.fps != null && cam.fps > 0) ? `${Number(cam.fps).toFixed(1)} fps` : '—';
+      const resFps = (res === '—' && fps === '—') ? '—' : `${res} · ${fps}`;
+      return `
+      <tr>
+        <td class="mono">${escapeHtml(cam.camera_id)}</td>
+        <td>${escapeHtml(cam.name || '—')}</td>
+        <td class="mono truncate">${escapeHtml(cam.source_url)}</td>
+        <td class="mono">${escapeHtml(resFps)}</td>
+        <td>${statusChip(cam.status || 'unknown')}</td>
+        <td><button class="btn danger" onclick="deleteCam('${String(cam.camera_id).replace(/'/g, "\\'")}')">Delete</button></td>
+      </tr>`;
+    }).join('');
+  }).catch(() => {
+    $('cam-table').innerHTML = '<tr><td colspan="6" class="empty">Failed to load cameras — check the cloud server.</td></tr>';
+  });
+}
+
+function zoneMapSlot(zone){
+  // What the Overview Ramp Map will look this zone up by:
+  //   grouped   → the group's display name (group_name)
+  //   standalone → the zone's own name
+  // Returns the candidate slot label (may or may not match a real
+  // ZONE_MAP_POSITIONS key).
+  if(zone.zone_group_id) return zone.group_name || '';
+  return zone.name || '';
+}
+
+function renderZoneSlotCell(zone, slotOwners){
+  const slot = zoneMapSlot(zone);
+  const onMap = slot && Object.prototype.hasOwnProperty.call(ZONE_MAP_POSITIONS, slot);
+  if(!onMap){
+    // Slot label doesn't match any "Zone N" floor-plan position.
+    // Most common causes: case mismatch (e.g. "zone 12" vs "Zone 12"),
+    // typo, or an orphan/duplicate zone the operator forgot about.
+    const tip = slot
+      ? `Label "${slot}" doesn't match any floor-plan slot. Expected one of Zone 1..Zone 12 (case-sensitive). This zone will NOT appear on the Ramp Map.`
+      : 'No display name yet — this zone will NOT appear on the Ramp Map.';
+    return `<td><span style="color:#999;font-style:italic" title="${escapeHtml(tip)}">— not mapped</span></td>`;
+  }
+  // Standalone zones share a slot with whoever the map renders first —
+  // if another row (group or standalone) already claims this slot,
+  // flag it so the operator knows there's a conflict.
+  const owners = slotOwners.get(slot) || [];
+  const isOwner = owners.length > 0 && owners[0] === zone.zone_id;
+  const competing = owners.filter(o => o !== zone.zone_id);
+  if(competing.length > 0){
+    const tip = `Slot "${slot}" is also claimed by: ${competing.join(', ')}. The Ramp Map will only render one of these — duplicates won't show.`;
+    return `<td><span style="color:#c33;font-weight:600" title="${escapeHtml(tip)}">⚠ ${escapeHtml(slot)}</span></td>`;
+  }
+  return `<td><span style="color:#2a7" title="Renders on the Ramp Map at this slot.">${escapeHtml(slot)}</span></td>`;
+}
+
+function computeSlotOwners(zones){
+  // For each map slot, list the "logical owners" — i.e. the zones whose
+  // map_slot is that label. Multiple members of the same group share one
+  // logical slot (that's by design, not a conflict), so we collapse
+  // group members under the group_id rather than per-zone.
+  const owners = new Map();  // slot → [owner_id, ...] where owner_id is group_id or zone_id
+  for(const z of zones){
+    const slot = zoneMapSlot(z);
+    if(!slot) continue;
+    const ownerId = z.zone_group_id || z.zone_id;
+    const list = owners.get(slot) || [];
+    if(!list.includes(ownerId)) list.push(ownerId);
+    owners.set(slot, list);
+  }
+  // Map back from (group_id|zone_id) to a list of zone_ids per slot so
+  // the per-row renderer can name the conflicting rows individually.
+  const perZone = new Map();
+  for(const z of zones){
+    const slot = zoneMapSlot(z);
+    if(!slot) continue;
+    const list = perZone.get(slot) || [];
+    list.push(z.zone_id);
+    perZone.set(slot, list);
+  }
+  // Return a map keyed by slot whose value is the list of conflicting
+  // group-or-standalone roots (deduped). Multi-member groups collapse
+  // to a single root, so a 4-cam Zone 5 doesn't self-flag.
+  const conflictRoots = new Map();
+  for(const [slot, rootList] of owners.entries()){
+    if(rootList.length > 1){
+      conflictRoots.set(slot, perZone.get(slot) || []);
+    }
+  }
+  return conflictRoots;
+}
+
+function fetchZones(){
+  fetch(API + '/api/zones').then(r => r.json()).then(zones => {
+    const el = $('zone-table');
+    if(!zones.length){
+      el.innerHTML = '<tr><td colspan="9" class="empty">No zones configured. Use “Add Zone” to define ramp polygons.</td></tr>';
+      return;
+    }
+    const slotOwners = computeSlotOwners(zones);
+    el.innerHTML = zones.map(zone => `
+      <tr>
+        <td class="mono">${escapeHtml(zone.zone_id)}</td>
+        <td>${escapeHtml(zone.name)}</td>
+        ${renderZoneSlotCell(zone, slotOwners)}
+        <td>${escapeHtml(rampTypeLabel(zone.ramp_type))}</td>
+        <td class="mono">${escapeHtml(zone.camera_id || '—')}</td>
+        <td>${escapeHtml(zone.max_vehicles)}</td>
+        <td>${escapeHtml(fmtDuration(zone.max_dwell_time_s || 0))}</td>
+        <td>${statusChip(zone.active ? 'online' : 'offline')}</td>
+        <td><div style="display:flex;gap:8px"><button class="btn" onclick="showEditZone('${String(zone.zone_id).replace(/'/g, "\\'")}')">Edit</button><button class="btn danger" onclick="deleteZone('${String(zone.zone_id).replace(/'/g, "\\'")}')">Delete</button></div></td>
+      </tr>
+    `).join('');
+  }).catch(() => {
+    $('zone-table').innerHTML = '<tr><td colspan="9" class="empty">Failed to load zones — check the cloud server.</td></tr>';
+  });
+}
+
+function fetchAlertsFull(){
+  // A new server fetch usually means filters changed (type/unacked toggled)
+  // or the operator hit Refresh — either way, start at page 1.
+  alertsPageIndex = 0;
+  const type = $('alert-filter').value;
+  const unackedOnly = $('alert-unacked-only').checked;
+  const url = API + '/api/alerts?limit=500'
+    + (type ? '&alert_type=' + encodeURIComponent(type) : '')
+    + (unackedOnly ? '&unacked_only=true' : '');
+  fetch(url).then(r => r.json()).then(data => {
+    // New shape: {alerts, counts}. Tolerate the old flat-array shape too so
+    // a stale cloud doesn't blank the page during rollout.
+    fullAlertData = Array.isArray(data) ? data : (data && data.alerts) || [];
+    fullAlertCounts = (data && !Array.isArray(data) && data.counts) || null;
+    renderAlertsFull();
+  }).catch(() => {
+    $('alerts-full').innerHTML = '<div class="empty">Failed to load alerts — check the cloud server.</div>';
+  });
+}
+
+function handleLiveSnapshotLoad(img, renderId){
+  if(Number(renderId) !== activeLiveRenderId) return;
+  img.style.opacity = '1';
+}
+
+function handleLiveSnapshotError(img, renderId){
+  if(Number(renderId) !== activeLiveRenderId) return;
+  const frame = img.closest('.stream-frame');
+  if(frame) frame.style.backgroundImage = 'none';
+  const loading = frame?.querySelector('.stream-loading');
+  if(loading) loading.textContent = 'Opening live stream...';
+}
+
+function handleLiveStreamLoad(img, renderId){
+  if(Number(renderId) !== activeLiveRenderId) return;
+  const frame = img.closest('.stream-frame');
+  const loading = frame?.querySelector('.stream-loading');
+  const empty = frame?.querySelector('.stream-empty');
+  img.dataset.ready = '1';
+  img.style.opacity = '1';
+  if(frame) frame.style.backgroundImage = 'none';
+  if(loading) loading.classList.add('hidden');
+  if(empty) empty.style.display = 'none';
+}
+
+function handleLiveStreamError(img, renderId){
+  if(Number(renderId) !== activeLiveRenderId) return;
+  if(img.dataset.ready === '1') return;
+  const frame = img.closest('.stream-frame');
+  const loading = frame?.querySelector('.stream-loading');
+  const empty = frame?.querySelector('.stream-empty');
+  img.style.opacity = '0';
+  if(loading) loading.classList.add('hidden');
+  if(empty) empty.style.display = 'flex';
+}
+
+function teardownLiveView(){
+  activeLiveStreamToken += 1;
+  if(liveFrameTimer){
+    clearTimeout(liveFrameTimer);
+    liveFrameTimer = null;
+  }
+  const stage = $('live-feeds');
+  if(!stage) return;
+  stage.querySelectorAll('img').forEach(img => {
+    img.onload = null;
+    img.onerror = null;
+    img.removeAttribute('src');
+    img.src = 'data:,';
+    img.dataset.ready = '';
+  });
+}
+
+function scheduleLiveFrame(cameraId, renderId, streamToken, delay = 0){
+  if(liveFrameTimer){
+    clearTimeout(liveFrameTimer);
+    liveFrameTimer = null;
+  }
+  liveFrameTimer = setTimeout(() => {
+    if(renderId !== activeLiveRenderId || streamToken !== activeLiveStreamToken) return;
+    const stage = $('live-feeds');
+    const live = stage?.querySelector('.stream-live');
+    if(!live) return;
+    live.onload = () => {
+      handleLiveStreamLoad(live, renderId);
+      scheduleLiveFrame(cameraId, renderId, streamToken, LIVE_PREVIEW_INTERVAL_MS);
+    };
+    live.onerror = () => {
+      handleLiveStreamError(live, renderId);
+      scheduleLiveFrame(cameraId, renderId, streamToken, 700);
+    };
+    live.src = `/api/cameras/${encodeURIComponent(cameraId)}/annotated?t=${Date.now()}`;
+  }, delay);
+}
+
+function setLiveInspector(cameraId){
+  const cam = liveCameraCache.find(item => item.camera_id === cameraId) || liveCameraCache[0];
+  const stage = $('live-feeds');
+  if(!cam){
+    selectedLiveCamera = null;
+    $('live-camera-select').value = '';
+    stage.innerHTML = '<div class="empty">No camera selected.</div>';
+    return;
+  }
+  teardownLiveView();
+  selectedLiveCamera = cam.camera_id;
+  $('live-camera-select').value = cam.camera_id;
+  activeLiveRenderId += 1;
+  const renderId = activeLiveRenderId;
+  activeLiveStreamToken += 1;
+  const streamToken = activeLiveStreamToken;
+  stage.innerHTML = `
+    <div class="stream-card">
+      <div class="stream-head">
+        <div>
+          <div class="stream-title">${escapeHtml(cam.name || cam.camera_id)}</div>
+          <div class="stream-meta">${escapeHtml(cam.camera_id)} · ${escapeHtml(cam.assigned_edge || 'unassigned')}</div>
+        </div>
+        ${statusChip(cam.status || 'unknown')}
+      </div>
+      <div class="stream-frame" style="background-image:url('/api/cameras/${encodeURIComponent(cam.camera_id)}/snapshot?t=${Date.now()}')">
+        <div class="stream-media">
+          <img
+            class="stream-snapshot"
+            src="/api/cameras/${encodeURIComponent(cam.camera_id)}/snapshot?t=${Date.now()}"
+            alt="${escapeHtml(cam.camera_id)} snapshot"
+            onload="handleLiveSnapshotLoad(this, ${renderId})"
+            onerror="handleLiveSnapshotError(this, ${renderId})"
+          >
+          <img
+            class="stream-live"
+            alt="${escapeHtml(cam.camera_id)}"
+            onload="handleLiveStreamLoad(this, ${renderId})"
+            onerror="handleLiveStreamError(this, ${renderId})"
+          >
+        </div>
+        <div class="stream-loading">Loading preview...</div>
+        <div class="stream-empty" style="display:none">Stream unavailable.<br>Edge agent may not be running for this source.</div>
+      </div>
+    </div>
+  `;
+  scheduleLiveFrame(cam.camera_id, renderId, streamToken, 0);
+  renderLiveSidebar();
+  setTimeout(() => {
+    if(renderId !== activeLiveRenderId || streamToken !== activeLiveStreamToken) return;
+    const frame = stage.querySelector('.stream-frame');
+    const live = frame?.querySelector('.stream-live');
+    const loading = frame?.querySelector('.stream-loading');
+    const empty = frame?.querySelector('.stream-empty');
+    if(live && live.dataset.ready !== '1' && loading){
+      loading.classList.add('hidden');
+      if(empty) empty.style.display = 'none';
+    }
+  }, 2500);
+}
+
+function fetchLive(){
+  fetch(API + '/api/cameras').then(r => r.json()).then(cams => {
+    const el = $('live-feeds');
+    const select = $('live-camera-select');
+    // Sort by displayed label using natural order, so arrival_cam_2 sits
+    // before arrival_cam_10 instead of after (lexicographic would put
+    // cam_10/11/12/.../18 above cam_2/3/.../9).
+    cams = (cams || []).slice().sort((a, b) =>
+      String(a.name || a.camera_id).localeCompare(
+        String(b.name || b.camera_id),
+        undefined,
+        {numeric: true, sensitivity: 'base'}
+      )
+    );
+    liveCameraCache = cams;
+    if(!cams.length){
+      el.innerHTML = '<div class="empty">No cameras configured. Add cameras first.</div>';
+      select.innerHTML = '<option value="">No cameras</option>';
+      selectedLiveCamera = null;
+      return;
+    }
+    select.innerHTML = cams.map(cam => `<option value="${escapeHtml(cam.camera_id)}">${escapeHtml(cam.name || cam.camera_id)}</option>`).join('');
+    const activeCamera = cams.find(cam => cam.camera_id === selectedLiveCamera) || cams[0];
+    setLiveInspector(activeCamera.camera_id);
+  }).catch(() => {
+    $('live-feeds').innerHTML = '<div class="empty">Failed to load cameras — check the cloud server.</div>';
+    $('live-camera-select').innerHTML = '<option value="">Cameras unavailable</option>';
+  });
+}
+
+function onLiveCameraChange(){
+  setLiveInspector($('live-camera-select').value);
+}
+
+// ---- Live View right-side metrics panel ----
+let liveSideTimer = null;
+
+function startLiveSideTimer(){
+  stopLiveSideTimer();
+  // Refresh the live-side metrics every 3s while the Live page is showing
+  // and a camera is selected. The image stream has its own refresh loop;
+  // this is just for the per-camera numbers (vehicles, dwell, fps, etc).
+  liveSideTimer = setInterval(() => {
+    if(currentPage !== 'live' || !selectedLiveCamera) return;
+    renderLiveSidebar();
+  }, 3000);
+}
+
+function stopLiveSideTimer(){
+  if(liveSideTimer){ clearInterval(liveSideTimer); liveSideTimer = null; }
+}
+
+function lsRow(label, value, valueClass){
+  const cls = valueClass ? ` ${valueClass}` : '';
+  return `<div class="ls-row"><span class="ls-label">${escapeHtml(label)}</span><span class="ls-value${cls}" title="${escapeHtml(String(value ?? '—'))}">${escapeHtml(String(value ?? '—'))}</span></div>`;
+}
+
+function renderLiveSidebar(){
+  const cam = liveCameraCache.find(c => c.camera_id === selectedLiveCamera);
+  const zonesEl = $('live-side-zones');
+  if(!zonesEl) return;
+  if(!cam){
+    zonesEl.innerHTML = '<div class="ls-row"><span class="ls-value muted">Select a camera to see live counts.</span></div>';
+    return;
+  }
+  const zonesForCam = (lastOverview && Array.isArray(lastOverview.zones))
+    ? lastOverview.zones.filter(z => z.camera_id === cam.camera_id) : [];
+  const totalVehicles = zonesForCam.reduce((s, z) => s + (Number(z.vehicle_count) || 0), 0);
+  const totalOverstay = zonesForCam.reduce((s, z) => s + (Number(z.overstay_count) || 0), 0);
+  const maxAvgDwell = zonesForCam.reduce((m, z) => Math.max(m, Number(z.avg_dwell_time_s) || 0), 0);
+  const anyOvercrowding = zonesForCam.some(z => z.overcrowding_alert);
+
+  zonesEl.innerHTML = [
+    lsRow('Zones on this camera', zonesForCam.length),
+    lsRow('Vehicles in view', totalVehicles, totalVehicles > 0 ? 'ok' : null),
+    lsRow('Active overstays', totalOverstay, totalOverstay > 0 ? 'warn' : null),
+    lsRow('Avg dwell (peak zone)', maxAvgDwell > 0 ? fmtDuration(maxAvgDwell) : '—'),
+    lsRow('Overcrowding', anyOvercrowding ? 'YES' : 'no', anyOvercrowding ? 'danger' : 'muted'),
+  ].join('');
+}
+
+// Cache the most recent /api/overview payload so renderLiveSidebar() can
+// derive per-camera rollups without making its own request. fetchAll()
+// already polls this on a global cadence.
+let lastOverview = null;
+
+function fetchEdge(){
+  fetch(API + '/api/overview').then(r => r.json()).then(data => {
+    const el = $('edge-cards');
+    if(!data.edges || !data.edges.length){
+      el.innerHTML = '<div class="empty">No edge devices reporting. Start the edge agent first.</div>';
+      return;
+    }
+    el.innerHTML = data.edges.map(edge => {
+      const errorCameras = Array.isArray(edge.error_cameras) ? edge.error_cameras : [];
+      const runtimeName = edge.edge_id || 'edge';
+      const intelNote = edge.igpu_note || edge.igpu_name || 'Decode telemetry unavailable';
+      const intelVideoNote = edge.igpu_video_pct != null 
+        ? `${edge.igpu_video_pct.toFixed(1)}% usage across video decoding engines` : null;
+      const intelEnhanceNote = edge.igpu_video_enhance_pct != null
+        ? `${edge.igpu_video_enhance_pct.toFixed(1)}% usage across video enhancement engines` : null;
+      const axeleraNote = edge.gpu_note || edge.gpu_name || 'Inference telemetry unavailable';
+      // Visual signal whenever the edge is running fewer cameras than it
+      // was assigned. The edge's own error_cameras list isn't always
+      // populated (race between camera death and the next heartbeat), so
+      // we additionally compute the gap from active vs assigned counts
+      // and flag it. Showing N/M alone is too easy to miss; an amber
+      // banner makes it unmissable.
+      const assigned = Number(edge.cameras_assigned || 0);
+      const activeNow = Number(edge.cameras_active || 0);
+      const missingCount = Math.max(0, assigned - activeNow);
+      const errorMarkup =
+        errorCameras.length
+          ? `<div class="edge-inline-note"><strong>Issue cameras</strong>${errorCameras.map(cameraId => `<span class="edge-error-chip">${escapeHtml(cameraId)}</span>`).join('')}</div>`
+          : (missingCount > 0
+              ? `<div class="edge-inline-note"><strong>${missingCount} camera${missingCount === 1 ? '' : 's'} missing</strong><span class="edge-error-chip">${activeNow} of ${assigned} sending frames</span></div>`
+              : '');
+
+      return `
+        <div class="edge-card">
+          <div class="edge-card-head">
+            <div>
+              <div class="edge-card-title">
+                <div class="edge-card-icon">◔</div>
+                <div>
+                  <div class="edge-card-name">${escapeHtml(runtimeName)}</div>
+                  <div class="edge-card-sub">Heartbeat ${escapeHtml(fmtTime(edge.ts) || '—')} · Uptime ${escapeHtml(fmtDuration(edge.uptime_s || 0))}</div>
+                </div>
+              </div>
+            </div>
+            <div style="text-align:right">
+              ${edgeHealthChip(edge)}
+              <div class="edge-card-sub" style="margin-top:8px">Last heartbeat: ${escapeHtml(fmtDateTime(edge.ts))}</div>
+            </div>
+          </div>
+
+          <div class="edge-resource-panel">
+            <div class="edge-resource-title">▤ Device Resources</div>
+            <div class="edge-util-grid">
+              ${renderEdgeUtilBar('CPU (Tracking + App)', edge.cpu_pct, 'System workload', 'blue', '⚙')}
+              ${renderEdgeUtilBar('RAM', edge.mem_pct, 'System memory', 'purple', '◫')}
+              ${renderEdgeUtilBar('iGPU (Video Decode)', edge.igpu_pct, intelVideoNote || intelNote, 'cyan', '▣')}
+              ${renderEdgeUtilBar('iGPU (Video Enhance)', edge.igpu_video_enhance_pct, intelEnhanceNote, 'blue', '◧')}
+              ${renderEdgeUtilBar('Axelera AIPU (Inference)', edge.gpu_pct, axeleraNote, 'amber', '⚡')}
+            </div>
+            ${errorMarkup}
+          </div>
+
+          <div class="edge-mini-grid">
+            ${renderEdgeMiniCard('◉',
+              (edge.cameras_active ?? 0) + ' / ' + (edge.cameras_assigned ?? 0),
+              'Cameras (active / assigned)')}
+            ${renderEdgeMiniCard('⌘', edge.zones_active ?? 0, 'Zones')}
+            ${renderEdgeMiniCard('∿', edge.inference_fps != null ? fmtNumber(edge.inference_fps) : '—', 'Inf FPS')}
+            ${renderEdgeMiniCard('⚡', edge.inference_ms != null ? fmtNumber(edge.inference_ms) : '—', 'Inf ms')}
+            ${renderEdgeMiniCard('UP', fmtUptimeCompact(edge.uptime_s || 0), 'Uptime', true)}
+          </div>
+        </div>
+      `;
+    }).join('');
+  }).catch(() => {
+    $('edge-cards').innerHTML = '<div class="empty">Unable to load edge telemetry right now.</div>';
+  });
+}
+
+function submitCamera(){
+  const data = {
+    camera_id: $('f-cam-id').value.trim(),
+    name: $('f-cam-name').value.trim(),
+    source_url: $('f-cam-url').value.trim(),
+    assigned_edge: $('f-cam-edge').value.trim()
+  };
+  if(!data.camera_id || !data.source_url){
+    alert('Camera ID and RTSP URL are required');
+    return;
+  }
+  fetch(API + '/api/cameras', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(data)
+  }).then(async r => {
+    if(r.ok){
+      closeModal('modal-cam');
+      ['f-cam-id','f-cam-name','f-cam-url'].forEach(id => $(id).value = '');
+      fetchCameras();
+      fetchLive();
+    } else {
+      const err = await r.json().catch(() => ({}));
+      alert(err.detail || 'Error');
+    }
+  }).catch(err => alert(err));
+}
+
+function submitZone(){
+  let poly;
+  try { poly = JSON.parse($('f-zone-poly').value || '[]'); }
+  catch(e){ alert('Invalid polygon JSON'); return; }
+  const data = {
+    zone_id: $('f-zone-id').value.trim(),
+    name: $('f-zone-name').value.trim(),
+    camera_id: $('f-zone-cam').value || null,
+    // Send the key explicitly so the PUT path knows to update the column
+    // (empty string → null = clear group; absent key on PUT = leave alone).
+    zone_group_id: $('f-zone-group')?.value || null,
+    ramp_type: normalizeRampType($('f-zone-ramp').value) || null,
+    max_vehicles: parseInt($('f-zone-max').value) || 20,
+    max_dwell_time_s: parseFloat($('f-zone-dwell').value) || 900,
+    zone_poly: poly
+  };
+  if(!data.zone_id || !data.name){
+    alert('Zone ID and Name are required');
+    return;
+  }
+  if(poly.length < 3){
+    alert('Draw at least 3 polygon points on the canvas before saving the zone');
+    return;
+  }
+  const isEdit = zoneModalMode === 'edit' && editingZoneId;
+  fetch(API + (isEdit ? '/api/zones/' + encodeURIComponent(editingZoneId) : '/api/zones'), {
+    method:isEdit ? 'PUT' : 'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(data)
+  }).then(async r => {
+    if(r.ok){
+      sendWsTopics('subscribe', ['zone:' + data.zone_id]);
+      closeModal('modal-zone');
+      fetchZones();
+      fetchAll();
+      fetchLive();
+    } else {
+      const err = await r.json().catch(() => ({}));
+      alert(err.detail || 'Error');
+    }
+  }).catch(err => alert(err));
+}
+
+function deleteCam(id){
+  if(confirm('Delete camera ' + id + '?')){
+    fetch(API + '/api/cameras/' + encodeURIComponent(id), {method:'DELETE'})
+      .then(async r => {
+        if(r.ok){
+          const result = await r.json().catch(() => ({}));
+          fetchCameras();
+          fetchZones();
+          fetchAll();
+          fetchLive();
+          if(result.deleted_zone_count){
+            alert(`Deleted camera ${id} and ${result.deleted_zone_count} linked zone(s).`);
+          }
+        } else {
+          const err = await r.json().catch(() => ({}));
+          alert(err.detail || 'Failed to delete camera');
+        }
+      })
+      .catch(err => alert(err));
+  }
+}
+
+function deleteZone(id){
+  if(!confirm('Delete zone ' + id + '?')) return;
+  fetch(API + '/api/zones/' + encodeURIComponent(id), {method:'DELETE'})
+    .then(async r => {
+      if(r.ok){
+        fetchZones();
+        fetchAll();
+      } else {
+        const err = await r.json().catch(() => ({}));
+        alert(err.detail || 'Failed to delete zone');
+      }
+    })
+    .catch(err => alert(err));
+}
+
+function ackAlert(id){
+  const target = fullAlertData.find(alert => alert.alert_id === id) || alertData.find(alert => alert.alert_id === id);
+  if(target && !target.acknowledged){
+    bumpUnackedAlerts(-1);
+    updateStats({});
+  }
+  fetch(API + '/api/alerts/' + id + '/acknowledge', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:'{}'
+  }).then(() => {
+    alertData = alertData.map(alert => alert.alert_id === id ? {...alert, acknowledged:true, acked_by:'operator'} : alert);
+    fullAlertData = fullAlertData
+      .map(alert => alert.alert_id === id ? {...alert, acknowledged:true, acked_by:'operator'} : alert)
+      .filter(alert => alertMatchesPageFilter(alert));
+    renderAlerts();
+    renderAlertsFull();
+    fetchAlertsFull();
+    fetchAll();
+  });
+}
+
+// Resolve admin/viewer mode BEFORE the first showPage() so that an admin
+// landing on #cameras isn't briefly bounced to overview. If /api/whoami
+// fails (network blip, server reload), default to viewer — better to
+// hide too much than to show admin UI we can't honor server-side.
+async function detectAccessMode(){
+  try{
+    const res = await fetch(API + '/api/whoami', {cache:'no-store'});
+    if(res.ok){
+      const data = await res.json();
+      isAdminUser = Boolean(data.is_admin);
+    }
+  }catch(_){ /* keep default: viewer */ }
+  if(!isAdminUser){
+    document.body.classList.add('viewer-mode');
+  }
+}
+
+(async () => {
+  await detectAccessMode();
+  fetchAll();
+  renderFeed();
+  connectWS();
+  window.addEventListener('hashchange', () => {
+    showPage(window.location.hash, {updateHash:false});
+  });
+  showPage(window.location.hash, {updateHash: !window.location.hash || window.location.hash === '#'});
+  setInterval(() => {
+    fetchAll();
+    if(currentPage === 'alerts') fetchAlertsFull();
+    if(currentPage === 'edge') fetchEdge();
+  }, 10000);
+})();
+$('zone-canvas').addEventListener('click', onZoneCanvasClick);
+$('zone-canvas').addEventListener('dblclick', e => { e.preventDefault(); finishZonePolygon(); });
+document.querySelectorAll('.modal-bg').forEach(m => m.addEventListener('click', e => { if(e.target === m) closeModal(m.id); }));
+</script>
+</body>
+</html>

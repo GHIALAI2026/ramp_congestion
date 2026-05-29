@@ -1,0 +1,21 @@
+# Allow __USER__ to reset the Axelera Metis NPU without a sudo password.
+# These are the four commands invoked by `axdevice --refresh`
+# (axelera.runtime.pci_scanner.LinuxPciScanner.rescan), which start.sh
+# calls in its restart cleanup after an edge-agent crash. Without this
+# rule, sudo blocks on a tty password prompt and silently hangs the
+# supervisor's restart loop.
+#
+# Scope is intentionally narrow: only the Metis device lifecycle.
+# The target user must already be in the `sudo` group; this rule only
+# changes whether a password is required for these four commands, not
+# what the user can do.
+#
+# Install (see README "One-time host setup" section):
+#   sed "s/__USER__/$USER/" deploy/axelera-metis-nopasswd.in \
+#     | sudo install -o root -g root -m 0440 /dev/stdin \
+#         /etc/sudoers.d/axelera-metis-nopasswd
+
+__USER__ ALL=(root) NOPASSWD: /usr/bin/lsof /dev/metis*
+__USER__ ALL=(root) NOPASSWD: /usr/bin/tee /sys/bus/pci/devices/*/remove
+__USER__ ALL=(root) NOPASSWD: /usr/bin/tee /sys/bus/pci/rescan
+__USER__ ALL=(root) NOPASSWD: /usr/sbin/modprobe -r metis

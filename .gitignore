@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments and local config
+.env
+.env.*
+venv/
+.venv/
+env/
+myvenv/
+.cli
+
+# Runtime state
+.logs/
+*.log
+*.db
+*.sqlite
+*.sqlite3
+edge_agent/config_cache.json
+
+# Media, model, and generated artifacts
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.pt
+*.onnx
+*.engine
+outputs*/
+validation_runs/
+build/
+dist/
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
+.gstack/
+cloud/static/alert_images/

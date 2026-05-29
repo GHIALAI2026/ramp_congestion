@@ -1,0 +1,3286 @@
+diff --git a/edge_agent/config.py b/edge_agent/config.py
+index d0f07cf..3dd57bd 100644
+--- a/edge_agent/config.py
++++ b/edge_agent/config.py
+@@ -128,3 +128,40 @@ CANVAS_H = int(os.environ.get("CANVAS_H", "500"))
+ 
+ # MQTT topic prefix
+ MQTT_TOPIC_PREFIX = "vehicle"
++
++# ------------------------------------------------------------------
++# Multi-process pipeline tuning
++# ------------------------------------------------------------------
++
++# Max expected frame resolution. SharedMemory slots are sized for this;
++# larger frames are dropped with a warning. Default covers 1080p.
++MAX_FRAME_W = int(os.environ.get("MAX_FRAME_W", "1920"))
++MAX_FRAME_H = int(os.environ.get("MAX_FRAME_H", "1080"))
++
++# Max JPEG payload per camera. 700 KB fits a heavily annotated 720p frame
++# at quality 70 with comfortable headroom.
++MAX_JPEG_BYTES = int(os.environ.get("MAX_JPEG_BYTES", str(2 * 1024 * 1024)))
++
++# Live preview is rescaled to this max width before encode.
++LIVE_PREVIEW_MAX_W = int(os.environ.get("LIVE_PREVIEW_MAX_W", "1280"))
++LIVE_JPEG_QUALITY = int(os.environ.get("LIVE_JPEG_QUALITY", "70"))
++
++# Number of analytics shards. Defaults to half of CPU cores, capped to 8.
++try:
++    _default_shards = max(1, min(8, (os.cpu_count() or 4) // 2))
++except Exception:
++    _default_shards = 2
++NUM_ANALYTICS_SHARDS = int(os.environ.get("NUM_ANALYTICS_SHARDS", str(_default_shards)))
++
++# Number of UI render workers. One viewer at a time means 1–2 is enough.
++NUM_UI_WORKERS = int(os.environ.get("NUM_UI_WORKERS", "1"))
++
++# When True, attempt to use TurboJPEG for encode; falls back to OpenCV.
++USE_TURBOJPEG = os.environ.get("USE_TURBOJPEG", "1") != "0"
++
++# TCP-only preflight uses this port-probe timeout instead of opening RTSP.
++PREFLIGHT_TCP_TIMEOUT_S = float(os.environ.get("PREFLIGHT_TCP_TIMEOUT_S", "1.5"))
++
++# Max camera slots — sized once, only matters as the upper bound for the
++# lock-free viewer counter Array.
++MAX_CAMERA_SLOTS = int(os.environ.get("MAX_CAMERA_SLOTS", "128"))
+diff --git a/edge_agent/http_server.py b/edge_agent/http_server.py
+index 18c07ea..05007a4 100644
+--- a/edge_agent/http_server.py
++++ b/edge_agent/http_server.py
+@@ -2,8 +2,8 @@
+ Lightweight HTTP server for camera snapshots.
+ Port 8003 — proxied by the cloud server's snapshot endpoint.
+ 
+-GET /snapshot/{camera_id}  → JPEG frame
+-GET /annotated/{camera_id} → JPEG with overlays
++GET /snapshot/{camera_id}  → raw JPEG frame
++GET /annotated/{camera_id} → JPEG with overlays (from SharedMemory slot)
+ GET /stream/{camera_id}    → MJPEG stream (annotated)
+ GET /health                → {"status": "ok"}
+ """
+@@ -27,7 +27,6 @@ async def _snapshot(request: web.Request) -> web.Response:
+     jpeg = camera_manager.get_snapshot(camera_id)
+     if jpeg is None:
+         raise web.HTTPServiceUnavailable(reason=f"No snapshot for {camera_id}")
+-
+     return web.Response(body=jpeg, content_type="image/jpeg")
+ 
+ 
+@@ -55,7 +54,7 @@ async def _annotated(request: web.Request) -> web.Response:
+ 
+ 
+ async def _mjpeg_stream(request: web.Request) -> web.StreamResponse:
+-    """MJPEG stream — server-push annotated frames."""
++    """MJPEG stream — push annotated frames as they arrive."""
+     camera_id = request.match_info["camera_id"]
+     camera_manager = request.app["camera_manager"]
+ 
+@@ -66,21 +65,30 @@ async def _mjpeg_stream(request: web.Request) -> web.StreamResponse:
+     resp.content_type = "multipart/x-mixed-replace; boundary=frame"
+     await resp.prepare(request)
+ 
+-    last_frame = None
++    last_ts = 0.0
+     frame_delay_s = 1.0 / max(0.1, float(getattr(cfg, "LIVE_ANNOTATE_FPS", 2.0)))
+     try:
+         while True:
+-            jpeg = camera_manager.get_annotated_snapshot(camera_id)
+-            if jpeg is None:
++            entry = camera_manager.get_annotated_snapshot_with_ts(camera_id)
++            if entry is not None:
++                jpeg, ts = entry
++                if ts > last_ts:
++                    last_ts = ts
++                    await resp.write(
++                        b"--frame\r\n"
++                        b"Content-Type: image/jpeg\r\n"
++                        b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n\r\n"
++                        + jpeg + b"\r\n"
++                    )
++            else:
+                 jpeg = camera_manager.get_snapshot(camera_id)
+-            if jpeg and jpeg is not last_frame:
+-                last_frame = jpeg
+-                await resp.write(
+-                    b"--frame\r\n"
+-                    b"Content-Type: image/jpeg\r\n"
+-                    b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n\r\n"
+-                    + jpeg + b"\r\n"
+-                )
++                if jpeg:
++                    await resp.write(
++                        b"--frame\r\n"
++                        b"Content-Type: image/jpeg\r\n"
++                        b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n\r\n"
++                        + jpeg + b"\r\n"
++                    )
+             await asyncio.sleep(frame_delay_s)
+     except (ConnectionResetError, asyncio.CancelledError):
+         pass
+diff --git a/edge_agent/main.py b/edge_agent/main.py
+index 1f10f7d..fdf91a6 100644
+--- a/edge_agent/main.py
++++ b/edge_agent/main.py
+@@ -4,19 +4,21 @@ Vehicle Zone Intelligence — Edge agent entry point.
+ Run with: PYTHONPATH=. python -m edge_agent.main
+ 
+ Startup sequence:
+-  1. Load inference engine (VoyagerEngine)
+-  2. Connect MQTT publisher
+-  3. Fetch camera/zone configs from cloud API
+-  4. Start camera streams
+-  5. Start MQTT listener (receives zone config updates)
+-  6. Start HTTP snapshot server
+-  7. Heartbeat loop (5s)
++  1. Build CameraManager (owns SharedMemory registries + worker pools)
++  2. Build VoyagerEngine wired to the manager's frame registry
++  3. Connect MQTT publisher (heartbeats only — analytics shards have their own)
++  4. Fetch camera/zone configs from cloud API
++  5. Register all cameras (allocates SHM slots up front)
++  6. Start analytics + UI worker pools (after SHM dicts are populated)
++  7. Actually start each CameraStream (Voyager add_source + preflight)
++  8. Start MQTT listener, HTTP snapshot server, heartbeat loop
+ """
+ 
+ from __future__ import annotations
+ 
+ import asyncio
+ import logging
++import multiprocessing
+ import signal
+ import time
+ 
+@@ -28,6 +30,10 @@ from edge_agent.comms.mqtt_publisher import MQTTPublisher
+ from edge_agent.http_server import run_http_server
+ from edge_agent.manager.camera_manager import CameraManager
+ from edge_agent.manager.config_store import ConfigStore
++from edge_agent.pipeline.shm_buffer import (
++    FrameBufferRegistry,
++    JPEGBufferRegistry,
++)
+ from edge_agent.schemas import EdgeHeartbeat
+ from edge_agent.system_metrics import SystemMetricsCollector
+ 
+@@ -39,43 +45,28 @@ logger = logging.getLogger("vehicle-edge")
+ 
+ 
+ def _camera_startup_priority(camera) -> tuple[int, int, str]:
+-    """Prefer fragile RTSP/NVR feeds on dedicated Voyager pipelines.
+-
+-    Voyager has one pipeline per AIPU sub-device. Once those are exhausted,
+-    extra cameras are attached with ``add_source()`` to an existing pipeline.
+-    In this deployment, the airport ``/stream1`` feeds are more likely to
+-    destabilize a shared pipeline than the Hikvision-style
+-    ``videoStreamId=`` URLs, so we start them earlier and leave the more
+-    share-safe URLs for the overflow slot.
+-    """
+     source = (camera.source_url or "").lower()
+     is_local = "127.0.0.1" in source or "localhost" in source
+     is_stream_path = "/stream" in source
+     is_videostream = "videostreamid=" in source
+-    # Order:
+-    #   1. local/demo feeds first (safe stream bootstrap)
+-    #   2. fragile /stream feeds next so they get dedicated pipelines
+-    #   3. videoStreamId feeds after that
+     local_rank = 0 if is_local else 1
+     fragility_rank = 0 if (is_stream_path and not is_videostream) else 1
+     return (local_rank, fragility_rank, camera.camera_id)
+ 
+ 
+-def _create_engine():
+-    """Create VoyagerEngine for Axelera Metis."""
+-    try:
+-        from edge_agent.pipeline.voyager_engine import VoyagerEngine
+-        engine = VoyagerEngine(
+-            network=cfg.VOYAGER_NETWORK,
+-            conf=cfg.INFERENCE_CONF,
+-            iou=cfg.INFERENCE_IOU,
+-        )
+-        logger.info("Using VoyagerEngine (Axelera Metis, network=%s)",
+-                     cfg.VOYAGER_NETWORK)
+-        return engine
+-    except Exception as e:
+-        logger.error("VoyagerEngine creation failed: %s", e)
+-        raise
++def _create_engine(frame_registry):
++    """Create VoyagerEngine for Axelera Metis, wired to the frame registry."""
++    from edge_agent.pipeline.voyager_engine import VoyagerEngine
++    engine = VoyagerEngine(
++        network=cfg.VOYAGER_NETWORK,
++        conf=cfg.INFERENCE_CONF,
++        iou=cfg.INFERENCE_IOU,
++        frame_registry=frame_registry,
++    )
++    logger.info(
++        "Using VoyagerEngine (Axelera Metis, network=%s)", cfg.VOYAGER_NETWORK,
++    )
++    return engine
+ 
+ 
+ async def heartbeat_loop(
+@@ -129,12 +120,25 @@ async def heartbeat_loop(
+ 
+ async def main():
+     start_time = time.time()
+-    logger.info("=== Vehicle Zone Intelligence Edge Agent starting (edge_id=%s) ===", cfg.EDGE_ID)
++    logger.info(
++        "=== Vehicle Zone Intelligence Edge Agent starting (edge_id=%s) ===",
++        cfg.EDGE_ID,
++    )
+ 
+-    # 1. Load inference engine
+-    engine = _create_engine()
++    # 1. SharedMemory registries (need to exist before engine + manager).
++    frame_registry = FrameBufferRegistry(
++        max_h=cfg.MAX_FRAME_H, max_w=cfg.MAX_FRAME_W,
++    )
++    jpeg_registry = JPEGBufferRegistry(max_size=cfg.MAX_JPEG_BYTES)
++
++    engine = _create_engine(frame_registry)
++    camera_manager = CameraManager(
++        engine=engine,
++        frame_registry=frame_registry,
++        jpeg_registry=jpeg_registry,
++    )
+ 
+-    # 2. Connect MQTT publisher
++    # 2. Connect MQTT publisher (heartbeats only at this layer)
+     mqtt_pub = MQTTPublisher()
+     mqtt_pub.connect()
+ 
+@@ -145,37 +149,43 @@ async def main():
+     for c in cameras:
+         logger.info("  %s (%s) — %d zones", c.camera_id, c.source_url, len(c.zones))
+ 
+-    # 4. Start camera manager + streams
+     cameras.sort(key=_camera_startup_priority)
+     logger.info(
+         "Voyager startup order: %s",
+         [f"{c.camera_id}<{c.source_url}>" for c in cameras],
+     )
+-    camera_manager = CameraManager(engine, mqtt_pub)
+ 
+-    # Batched parallel startup (5 at a time) to prevent network storms
+-    # while significantly reducing total initialization time.
+-    startup_semaphore = asyncio.Semaphore(5)
++    # 4. Pre-register every camera so SHM slots exist before the worker
++    # processes are spawned. We use add_camera() to allocate the slot,
++    # but we DEFER calling stream.start() until workers are alive — so
++    # do the slot/SHM/stream registration here, then start, then start workers.
++    # CameraManager.add_camera already calls stream.start, but at this
++    # point analytics_pool/ui_pool are not yet started — that is fine
++    # for slot allocation. The streams will simply queue their first
++    # CONFIG/DATA messages; analytics shards drain them as soon as they
++    # boot.
++    startup_semaphore = asyncio.Semaphore(10)
+ 
+     async def _safe_start(cam):
+         async with startup_semaphore:
+-            # add_camera contains blocking I/O (pre-flight checks), so run in thread.
+             await asyncio.to_thread(
+-                camera_manager.add_camera, cam.camera_id, cam.source_url, cam.zones
++                camera_manager.add_camera, cam.camera_id, cam.source_url, cam.zones,
+             )
+ 
+     await asyncio.gather(*(_safe_start(cam) for cam in cameras))
+ 
++    # 5. Now that every initial camera has a SHM slot, spawn the workers.
++    # On Linux's default fork start_method, the child inherits the SHM
++    # dicts that the manager built up. (For spawn we'd need to pass the
++    # dicts explicitly; the renderer pool does that already.)
++    camera_manager.start_workers()
++
+     metrics_collector = SystemMetricsCollector()
+ 
+-    # 5. Start MQTT listener
++    # 6. MQTT listener for runtime camera/zone updates
+     listener = MQTTListener(camera_manager)
+     listener.start()
+ 
+-    # 5b. Start UI Renderer and Analytics processes
+-    camera_manager._ui_renderer.start()
+-    camera_manager._analytics_worker.start()
+-
+     # Graceful shutdown
+     loop = asyncio.get_event_loop()
+     stop_event = asyncio.Event()
+@@ -190,10 +200,11 @@ async def main():
+         except NotImplementedError:
+             pass
+ 
+-    # 6. Start HTTP snapshot server + heartbeat loop
++    # 7. HTTP server + heartbeat
+     http_task = asyncio.create_task(run_http_server(camera_manager))
+     hb_task = asyncio.create_task(
+-        heartbeat_loop(mqtt_pub, camera_manager, engine, start_time, metrics_collector))
++        heartbeat_loop(mqtt_pub, camera_manager, engine, start_time, metrics_collector),
++    )
+ 
+     logger.info("Edge agent running. Cameras streaming to zones.")
+ 
+@@ -204,7 +215,7 @@ async def main():
+     hb_task.cancel()
+     listener.stop()
+     camera_manager.stop_all()
+-    if hasattr(engine, 'stop_all'):
++    if hasattr(engine, "stop_all"):
+         engine.stop_all()
+     metrics_collector.close()
+     mqtt_pub.disconnect()
+@@ -212,4 +223,9 @@ async def main():
+ 
+ 
+ if __name__ == "__main__":
++    # Linux fork is required for SHM/Array inheritance in our worker pools.
++    try:
++        multiprocessing.set_start_method("fork", force=False)
++    except RuntimeError:
++        pass
+     asyncio.run(main())
+diff --git a/edge_agent/manager/camera_manager.py b/edge_agent/manager/camera_manager.py
+index e2d87a4..66b1996 100644
+--- a/edge_agent/manager/camera_manager.py
++++ b/edge_agent/manager/camera_manager.py
+@@ -1,31 +1,101 @@
+-"""Thread-safe registry of active CameraStream instances."""
++"""Owns the cross-process pipeline plumbing for the edge agent.
++
++In addition to tracking active CameraStream instances, this manager:
++
++  * Allocates a fixed-size camera slot table backed by ``multiprocessing.Array``
++    so the analytics workers can read viewer counts lock-free.
++  * Owns the SharedMemory frame and JPEG registries.
++  * Spawns + tears down the AnalyticsPool and UIRendererPool.
++"""
+ 
+ from __future__ import annotations
+ 
+ import logging
+ import multiprocessing
+ import threading
++from typing import Optional
+ 
++from edge_agent import config as cfg
++from edge_agent.pipeline.analytics_worker import AnalyticsPool
+ from edge_agent.pipeline.camera_stream import CameraStream
+-from edge_agent.pipeline.ui_renderer import UIRenderer
+-from edge_agent.pipeline.analytics_worker import AnalyticsWorker
++from edge_agent.pipeline.shm_buffer import (
++    FrameBufferRegistry,
++    JPEGBufferRegistry,
++)
++from edge_agent.pipeline.ui_renderer import UIRendererPool
+ from edge_agent.schemas import ZoneConfig
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+ class CameraManager:
+-    def __init__(self, engine, mqtt_pub):
++    def __init__(
++        self,
++        engine,
++        frame_registry: FrameBufferRegistry,
++        jpeg_registry: JPEGBufferRegistry,
++    ):
+         self._engine = engine
+-        self._mqtt_pub = mqtt_pub
+-        self._manager = multiprocessing.Manager()
+-        self._viewer_dict = self._manager.dict() # camera_id -> int (count)
+-        self._ui_renderer = UIRenderer()
+-        self._analytics_worker = AnalyticsWorker(
+-            self._ui_renderer._task_queue, self._viewer_dict
+-        )
+-        self._streams: dict[str, CameraStream] = {}
+         self._lock = threading.Lock()
++        self._streams: dict[str, CameraStream] = {}
++
++        # Slot allocation — viewer counter Array is sized once.
++        self._max_slots = max(1, int(cfg.MAX_CAMERA_SLOTS))
++        self._viewer_array = multiprocessing.Array("i", self._max_slots, lock=True)
++        self._slot_by_cam: dict[str, int] = {}
++        self._free_slots: list[int] = list(range(self._max_slots))[::-1]
++        self._slot_lock = threading.Lock()
++
++        self._frame_registry = frame_registry
++        self._jpeg_registry = jpeg_registry
++
++        # Renderer pool — owns its own task queue.
++        self._ui_pool = UIRendererPool(num_workers=cfg.NUM_UI_WORKERS)
++        # Analytics pool — feeds the renderer pool's task queue.
++        self._analytics_pool = AnalyticsPool(
++            num_shards=cfg.NUM_ANALYTICS_SHARDS,
++            ui_signal_queue=self._ui_pool.task_queue,
++            viewer_array=self._viewer_array,
++        )
++
++    # ------------------------------------------------------------------
++    # Lifecycle
++    # ------------------------------------------------------------------
++
++    @property
++    def frame_registry(self) -> FrameBufferRegistry:
++        return self._frame_registry
++
++    @property
++    def jpeg_registry(self) -> JPEGBufferRegistry:
++        return self._jpeg_registry
++
++    def start_workers(self) -> None:
++        """Start analytics + UI worker pools.
++
++        Must be called *after* all initial cameras are registered so the
++        worker processes inherit the fully-populated SharedMemory dicts.
++        """
++        self._ui_pool.start()
++        self._analytics_pool.start()
++
++    def stop_all(self) -> None:
++        with self._lock:
++            streams = list(self._streams.values())
++            self._streams.clear()
++        for s in streams:
++            try:
++                s.stop()
++            except Exception:
++                logger.exception("Error stopping camera stream")
++        self._analytics_pool.stop()
++        self._ui_pool.stop()
++        self._frame_registry.shutdown()
++        self._jpeg_registry.shutdown()
++
++    # ------------------------------------------------------------------
++    # Camera CRUD
++    # ------------------------------------------------------------------
+ 
+     def add_camera(
+         self,
+@@ -37,19 +107,35 @@ class CameraManager:
+             if camera_id in self._streams:
+                 logger.info("Camera %s already running, skipping", camera_id)
+                 return
++            slot_idx = self._allocate_slot(camera_id)
++            if slot_idx < 0:
++                logger.error(
++                    "Camera %s rejected — no free slots (max=%d)",
++                    camera_id, self._max_slots,
++                )
++                return
++            # Pre-allocate SHM segments before any data flows.
++            frame_slot = self._frame_registry.register(camera_id)
++            jpeg_slot = self._jpeg_registry.register(camera_id)
++            self._ui_pool.register_camera(camera_id, frame_slot, jpeg_slot)
++
+             stream = CameraStream(
+-                camera_id, 
+-                source_url, 
+-                zones, 
+-                self._engine, 
+-                self._mqtt_pub, 
+-                self._ui_renderer,
+-                self._analytics_worker,
+-                self._viewer_dict
++                camera_id,
++                source_url,
++                zones,
++                slot_idx,
++                self._engine,
++                self._analytics_pool,
++                self._viewer_array,
+             )
+-            stream.start()
+             self._streams[camera_id] = stream
+-            logger.info("Added camera %s (%s)", camera_id, source_url)
++
++        try:
++            stream.start()
++            logger.info("Added camera %s (%s, slot=%d)",
++                        camera_id, source_url, slot_idx)
++        except Exception:
++            logger.exception("Camera %s start failed", camera_id)
+ 
+     def sync_camera(
+         self,
+@@ -62,19 +148,26 @@ class CameraManager:
+         if stream is None:
+             self.add_camera(camera_id, source_url, zones)
+             return
+-
+         stream.update_zones(zones)
+         logger.info("Synced camera %s with %d zones", camera_id, len(zones))
+ 
+     def remove_camera(self, camera_id: str) -> None:
+         with self._lock:
+             stream = self._streams.pop(camera_id, None)
+-        if stream:
++        if stream is None:
++            return
++        try:
+             stream.stop()
+-            logger.info("Removed camera %s", camera_id)
++        except Exception:
++            logger.exception("Error stopping camera %s", camera_id)
++        # Release SHM + slot only after the stream is stopped.
++        self._ui_pool.unregister_camera(camera_id)
++        self._frame_registry.unregister(camera_id)
++        self._jpeg_registry.unregister(camera_id)
++        self._release_slot(camera_id)
++        logger.info("Removed camera %s", camera_id)
+ 
+     def update_zone(self, zone_config: ZoneConfig) -> None:
+-        """Route a zone config update to the correct camera stream."""
+         with self._lock:
+             stream = self._streams.get(zone_config.camera_id)
+         if stream:
+@@ -82,19 +175,44 @@ class CameraManager:
+         else:
+             logger.warning("Zone update for unknown camera %s", zone_config.camera_id)
+ 
+-    def get_snapshot(self, camera_id: str) -> bytes | None:
++    # ------------------------------------------------------------------
++    # Snapshots / viewers — used by HTTP server
++    # ------------------------------------------------------------------
++
++    def get_snapshot(self, camera_id: str) -> Optional[bytes]:
+         with self._lock:
+             stream = self._streams.get(camera_id)
+         if stream is None:
+             return None
+-        return stream.get_snapshot()
++        frame = stream.get_snapshot_frame()
++        if frame is None:
++            return None
++        import cv2
++        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
++        return buf.tobytes() if ok else None
+ 
+-    def get_annotated_snapshot(self, camera_id: str) -> bytes | None:
+-        with self._lock:
+-            stream = self._streams.get(camera_id)
+-        if stream is None:
++    def get_annotated_snapshot(self, camera_id: str) -> Optional[bytes]:
++        slot = self._jpeg_registry.get(camera_id)
++        if slot is None:
++            return None
++        jpeg, ts = slot.read()
++        if jpeg is None:
++            return None
++        import time
++        if (time.time() - ts) > cfg.LIVE_FRAME_STALE_S:
++            return None
++        return jpeg
++
++    def get_annotated_snapshot_with_ts(
++        self, camera_id: str,
++    ) -> Optional[tuple[bytes, float]]:
++        slot = self._jpeg_registry.get(camera_id)
++        if slot is None:
++            return None
++        jpeg, ts = slot.read()
++        if jpeg is None:
+             return None
+-        return stream.get_annotated_snapshot()
++        return jpeg, ts
+ 
+     def add_viewer(self, camera_id: str) -> bool:
+         with self._lock:
+@@ -110,23 +228,23 @@ class CameraManager:
+         if stream is not None:
+             stream.remove_viewer()
+ 
+-    def stop_all(self) -> None:
+-        with self._lock:
+-            streams = list(self._streams.values())
+-            self._streams.clear()
+-        for s in streams:
+-            s.stop()
+-        self._analytics_worker.stop()
+-        self._ui_renderer.stop()
+-        self._manager.shutdown()
++    # ------------------------------------------------------------------
++    # Stats
++    # ------------------------------------------------------------------
+ 
+     def get_stats(self) -> dict:
+         with self._lock:
+             cameras_assigned = len(self._streams)
+-            cameras_active = sum(1 for s in self._streams.values() if s.has_fresh_inference)
+-            cameras_errored = sum(1 for s in self._streams.values() if s.health_problem)
+-            zones_active = sum(len(s._analytics) for s in self._streams.values())
+-            error_cams = [cid for cid, s in self._streams.items() if s.health_problem]
++            cameras_active = sum(
++                1 for s in self._streams.values() if s.has_fresh_inference
++            )
++            cameras_errored = sum(
++                1 for s in self._streams.values() if s.health_problem
++            )
++            zones_active = sum(s.zone_count for s in self._streams.values())
++            error_cams = [
++                cid for cid, s in self._streams.items() if s.health_problem
++            ]
+         return {
+             "cameras_active": cameras_active,
+             "cameras_assigned": cameras_assigned,
+@@ -134,3 +252,29 @@ class CameraManager:
+             "zones_active": zones_active,
+             "error_cameras": error_cams,
+         }
++
++    # ------------------------------------------------------------------
++    # Slot management
++    # ------------------------------------------------------------------
++
++    def _allocate_slot(self, camera_id: str) -> int:
++        with self._slot_lock:
++            existing = self._slot_by_cam.get(camera_id)
++            if existing is not None:
++                return existing
++            if not self._free_slots:
++                return -1
++            slot = self._free_slots.pop()
++            self._slot_by_cam[camera_id] = slot
++            with self._viewer_array.get_lock():
++                self._viewer_array[slot] = 0
++            return slot
++
++    def _release_slot(self, camera_id: str) -> None:
++        with self._slot_lock:
++            slot = self._slot_by_cam.pop(camera_id, None)
++            if slot is None:
++                return
++            with self._viewer_array.get_lock():
++                self._viewer_array[slot] = 0
++            self._free_slots.append(slot)
+diff --git a/edge_agent/pipeline/analytics_worker.py b/edge_agent/pipeline/analytics_worker.py
+index 201494f..cfd566d 100644
+--- a/edge_agent/pipeline/analytics_worker.py
++++ b/edge_agent/pipeline/analytics_worker.py
+@@ -1,6 +1,16 @@
+-"""
+-AnalyticsWorker — Dedicated multiprocessing worker for vehicle tracking and counting.
+-Bridges the Ingestion process and the UI Rendering process.
++"""Sharded analytics workers — vehicle tracking and zone counting.
++
++Replaces the single-process AnalyticsWorker with a process pool keyed by
++``hash(camera_id) % K``. Each shard owns a slice of cameras end-to-end:
++tracker state, zone analytics, and MQTT publishing for that slice never
++leave the process.
++
++Crucially, the workers no longer receive frame pixels — only
++``(cam_id, dets, frame_w, frame_h, ts, inf_ms, fps)``. This collapses the
++per-frame IPC payload from ~6 MB to a few hundred bytes.
++
++The frame pixels (when needed for the live preview) flow through a
++separate SharedMemory channel directly to the UIRenderer.
+ """
+ 
+ from __future__ import annotations
+@@ -11,9 +21,6 @@ import os
+ import queue
+ import time
+ 
+-import cv2
+-import numpy as np
+-
+ from edge_agent import config as cfg
+ from edge_agent.comms.mqtt_publisher import MQTTPublisher
+ from edge_agent.pipeline.ocsort import OCSORTTracker
+@@ -21,28 +28,66 @@ from edge_agent.pipeline.vehicle_analytics import VehicleZoneAnalytics
+ 
+ logger = logging.getLogger(__name__)
+ 
+-def analytics_worker_proc(
+-    task_queue: multiprocessing.JoinableQueue,
+-    ui_task_queue: multiprocessing.JoinableQueue,
+-    viewer_dict: dict, # camera_id -> bool
++
++# --------------------------------------------------------------------------
++# Worker process entry point
++# --------------------------------------------------------------------------
++
++def _analytics_shard_proc(
++    shard_idx: int,
++    task_queue: "multiprocessing.Queue",
++    ui_signal_queue: "multiprocessing.Queue",
++    viewer_array,  # multiprocessing.Array of int counts, indexed by cam slot
++    cam_slot_map: dict,  # camera_id -> int slot index (snapshot at startup)
+ ):
+-    """Entry point for the Analytics Process."""
+-    # Set process priority (Niceness)
++    """Entry point for one analytics shard.
++
++    The shard owns a subset of cameras. It runs tracking + zone analytics
++    + MQTT publishing for those cameras only. ``ui_signal_queue`` is used
++    to wake the UI worker when a watched camera produces a new frame.
++    """
+     try:
+-        os.nice(5) # Lower priority than ingestion, higher than UI
++        os.nice(5)
+     except Exception:
+         pass
+ 
+-    logger.info("AnalyticsWorker process started (PID: %d)", os.getpid())
+-    
++    proc_logger = logging.getLogger(f"analytics-{shard_idx}")
++    proc_logger.info("AnalyticsShard %d started (pid=%d)", shard_idx, os.getpid())
++
+     mqtt_pub = MQTTPublisher()
+-    mqtt_pub.connect()
++    try:
++        mqtt_pub.connect()
++    except Exception:
++        proc_logger.exception("Shard %d: MQTT connect failed", shard_idx)
+ 
+-    # Per-camera state
+     trackers: dict[str, OCSORTTracker] = {}
+-    analytics: dict[str, dict[str, VehicleZoneAnalytics]] = {} # cam_id -> {zone_id: obj}
+-    last_annotate_ts: dict[str, float] = {}
+-    last_publish_ts: dict[str, dict[str, float]] = {} # cam_id -> {zone_id: ts}
++    analytics: dict[str, dict[str, VehicleZoneAnalytics]] = {}
++    last_publish_ts: dict[str, dict[str, float]] = {}
++    last_ui_signal_ts: dict[str, float] = {}
++
++    # Local copy of cam→slot map; updated when CONFIG messages arrive.
++    cam_slots: dict[str, int] = dict(cam_slot_map)
++
++    def _ensure_cam(cam_id: str) -> None:
++        if cam_id not in trackers:
++            trackers[cam_id] = OCSORTTracker(
++                high_thresh=cfg.OCSORT_HIGH_THRESH,
++                low_thresh=cfg.OCSORT_LOW_THRESH,
++                match_thresh=cfg.OCSORT_MATCH_THRESH,
++                max_time_lost=cfg.OCSORT_MAX_TIME_LOST,
++                bbox_inflation=cfg.OCSORT_BBOX_INFLATION,
++            )
++            analytics.setdefault(cam_id, {})
++            last_publish_ts.setdefault(cam_id, {})
++
++    def _has_viewer(cam_id: str) -> bool:
++        slot = cam_slots.get(cam_id)
++        if slot is None:
++            return False
++        try:
++            return viewer_array[slot] > 0
++        except Exception:
++            return False
+ 
+     while True:
+         try:
+@@ -50,172 +95,212 @@ def analytics_worker_proc(
+         except queue.Empty:
+             continue
+ 
+-        if task is None: # Shutdown
+-            task_queue.task_done()
++        if task is None:
+             break
+ 
+         try:
+-            msg_type = task[0]
+-            
+-            if msg_type == "CONFIG":
+-                _, cam_id, zones = task
+-                _update_camera_config(cam_id, zones, trackers, analytics)
+-                
+-            elif msg_type == "DATA":
+-                _, cam_id, frame, detections, ts, inf_ms, fps = task
+-                
+-                # Ensure we have a tracker for this camera
+-                if cam_id not in trackers:
+-                    # Default initialization if config hasn't arrived yet
+-                    _update_camera_config(cam_id, [], trackers, analytics)
+-
+-                # 1. Run Tracking
++            kind = task[0]
++
++            if kind == "CONFIG":
++                _, cam_id, slot_idx, zones = task
++                cam_slots[cam_id] = slot_idx
++                _ensure_cam(cam_id)
++                _sync_zones(cam_id, zones, analytics)
++
++            elif kind == "REMOVE":
++                _, cam_id = task
++                trackers.pop(cam_id, None)
++                analytics.pop(cam_id, None)
++                last_publish_ts.pop(cam_id, None)
++                last_ui_signal_ts.pop(cam_id, None)
++
++            elif kind == "DATA":
++                _, cam_id, detections, frame_w, frame_h, ts, inf_ms, fps = task
++
++                _ensure_cam(cam_id)
++
+                 tracker = trackers[cam_id]
+                 tracked = tracker.update(detections)
+ 
+-                # Build track_id -> class_id mapping
+-                det_classes: dict[int, int] = {}
+-                for det in detections:
+-                    for track_id, tx1, ty1, tx2, ty2, tconf in tracked:
+-                        dx = abs((det[0] + det[2]) / 2 - (tx1 + tx2) / 2)
+-                        dy = abs((det[1] + det[3]) / 2 - (ty1 + ty2) / 2)
+-                        if dx < 50 and dy < 50:
+-                            det_classes[int(track_id)] = int(det[5])
+-                            break
+-
+-                tracked_with_class = []
+-                for track_id, x1, y1, x2, y2, conf in tracked:
+-                    cls_id = det_classes.get(int(track_id), cfg.DEFAULT_VEHICLE_CLASS_ID)
+-                    tracked_with_class.append((int(track_id), x1, y1, x2, y2, conf, cls_id))
+-
+-                # 2. Run Zone Analytics & MQTT
+-                actual_h, actual_w = frame.shape[:2]
+-                cam_analytics = analytics.get(cam_id, {})
++                cam_zones = analytics.get(cam_id, {})
+                 cam_pub_ts = last_publish_ts.setdefault(cam_id, {})
+ 
+-                for zid, zone_obj in cam_analytics.items():
++                for zid, zone_obj in cam_zones.items():
+                     last_ts = cam_pub_ts.get(zid, 0.0)
+-                    if ts - last_ts >= 1.0: # 1Hz MQTT publishing
+-                        metrics = zone_obj.update(tracked_with_class, actual_w, actual_h, ts, inf_ms, fps)
+-                        mqtt_pub.publish_metrics(metrics)
+-                        
+-                        alerts = zone_obj.check_alerts(metrics, ts)
+-                        for alert in alerts:
+-                            mqtt_pub.publish_alert(alert)
+-                        
+-                        cam_pub_ts[zid] = ts
+-
+-                # 3. Offload to UI Renderer if watched
+-                if viewer_dict.get(cam_id, 0) > 0:
++                    if ts - last_ts < 1.0:
++                        continue
++                    metrics = zone_obj.update(
++                        tracked, frame_w, frame_h, ts, inf_ms, fps,
++                    )
++                    mqtt_pub.publish_metrics(metrics)
++                    for alert in zone_obj.check_alerts(metrics, ts):
++                        mqtt_pub.publish_alert(alert)
++                    cam_pub_ts[zid] = ts
++
++                # Wake the UI worker only when:
++                #   - someone is watching this camera, AND
++                #   - we haven't already signalled within the live-preview interval.
++                if _has_viewer(cam_id):
+                     live_fps = max(0.1, float(getattr(cfg, "LIVE_ANNOTATE_FPS", 2.0)))
+-                    prev_annotate = last_annotate_ts.get(cam_id, 0.0)
+-                    
+-                    if ts - prev_annotate >= (1.0 / live_fps):
+-                        last_annotate_ts[cam_id] = ts
+-                        
+-                        # Prepare data for UI process
+-                        zones_polygons = []
+-                        for zid, zone_obj in cam_analytics.items():
+-                            poly_canvas = zone_obj._zone_poly_canvas
+-                            if poly_canvas is not None and len(poly_canvas) >= 3:
+-                                sx, sy = actual_w / cfg.CANVAS_W, actual_h / cfg.CANVAS_H
+-                                scaled = poly_canvas.copy().astype(np.float64)
+-                                scaled[:, 0, 0] *= sx
+-                                scaled[:, 0, 1] *= sy
+-                                zones_polygons.append((zid, scaled.astype(np.int32)))
+-
+-                        # Dwell labels (simplified for worker)
+-                        # In a real app, dwell state would be in zone_obj or here. 
+-                        # For simplicity, we pass empty dwell labels or calculate them if needed.
+-                        dwell_labels = {} # Could be expanded
+-
+-                        ui_task = (
+-                            cam_id, frame, detections, tracked, det_classes, 
+-                            zones_polygons, dwell_labels, (inf_ms, fps), ts
+-                        )
++                    interval = 1.0 / live_fps
++                    if ts - last_ui_signal_ts.get(cam_id, 0.0) >= interval:
++                        last_ui_signal_ts[cam_id] = ts
++
++                        # Build per-zone polygons in canvas space (small payload —
++                        # the UI renderer caches the scaled pixel polygon).
++                        zone_polys = []
++                        for zid, zone_obj in cam_zones.items():
++                            poly = zone_obj.zone_poly_canvas
++                            if poly is not None:
++                                zone_polys.append((zid, poly.tolist()))
++
+                         try:
+-                            ui_task_queue.put_nowait(ui_task)
++                            ui_signal_queue.put_nowait((
++                                cam_id,
++                                tracked,
++                                zone_polys,
++                                (frame_w, frame_h),
++                                (inf_ms, fps),
++                                ts,
++                            ))
+                         except queue.Full:
+                             pass
+ 
+-        except Exception as e:
+-            logger.error("AnalyticsWorker error: %s", e)
+-        finally:
+-            task_queue.task_done()
++        except Exception:
++            proc_logger.exception("Shard %d task error", shard_idx)
+ 
+-    mqtt_pub.disconnect()
+-    logger.info("AnalyticsWorker process exiting.")
++    try:
++        mqtt_pub.disconnect()
++    except Exception:
++        pass
++    proc_logger.info("AnalyticsShard %d exiting", shard_idx)
+ 
+ 
+-def _update_camera_config(cam_id, zones, trackers, analytics_map):
+-    """Sync camera configurations within the worker process."""
+-    if cam_id not in trackers:
+-        trackers[cam_id] = OCSORTTracker(
+-            high_thresh=cfg.OCSORT_HIGH_THRESH,
+-            low_thresh=cfg.OCSORT_LOW_THRESH,
+-            match_thresh=cfg.OCSORT_MATCH_THRESH,
+-            max_time_lost=cfg.OCSORT_MAX_TIME_LOST,
+-            bbox_inflation=cfg.OCSORT_BBOX_INFLATION,
+-        )
+-    
+-    current_zones = analytics_map.setdefault(cam_id, {})
++def _sync_zones(cam_id: str, zones, analytics_map: dict) -> None:
++    current = analytics_map.setdefault(cam_id, {})
+     new_ids = {z.zone_id for z in zones}
+-    
+-    # Add/Update
+     for z_cfg in zones:
+-        if z_cfg.zone_id in current_zones:
+-            current_zones[z_cfg.zone_id].update_config(z_cfg)
++        if z_cfg.zone_id in current:
++            current[z_cfg.zone_id].update_config(z_cfg)
+         else:
+-            current_zones[z_cfg.zone_id] = VehicleZoneAnalytics(z_cfg, cfg.EDGE_ID)
+-            
+-    # Remove old
+-    for zid in list(current_zones.keys()):
++            current[z_cfg.zone_id] = VehicleZoneAnalytics(z_cfg, cfg.EDGE_ID)
++    for zid in list(current.keys()):
+         if zid not in new_ids:
+-            del current_zones[zid]
++            del current[zid]
++
++
++# --------------------------------------------------------------------------
++# Pool manager
++# --------------------------------------------------------------------------
+ 
++class AnalyticsPool:
++    """Manages a fleet of analytics shard processes.
+ 
+-class AnalyticsWorker:
+-    """Manager for the Analytics Process."""
++    Cameras are sharded by ``hash(cam_id) % num_shards``. Each shard owns
++    its slice of cameras end-to-end (tracker, zones, MQTT). The producer
++    side calls submit_data / update_config / remove_camera and never
++    needs to know which shard a camera lives on.
++    """
+ 
+-    def __init__(self, ui_task_queue, viewer_dict):
+-        self._ui_task_queue = ui_task_queue
+-        self._viewer_dict = viewer_dict
+-        self._task_queue = multiprocessing.JoinableQueue(maxsize=50)
+-        self._process = None
++    def __init__(
++        self,
++        num_shards: int,
++        ui_signal_queue,
++        viewer_array,
++    ):
++        self._num_shards = max(1, int(num_shards))
++        self._ui_signal_queue = ui_signal_queue
++        self._viewer_array = viewer_array
++        self._task_queues: list[multiprocessing.Queue] = [
++            multiprocessing.Queue(maxsize=200) for _ in range(self._num_shards)
++        ]
++        self._processes: list[multiprocessing.Process] = []
++        self._cam_slot_map: dict[str, int] = {}
++        self._started = False
+ 
+-    def start(self):
+-        if self._process and self._process.is_alive():
++    @property
++    def num_shards(self) -> int:
++        return self._num_shards
++
++    def _shard_for(self, cam_id: str) -> int:
++        return hash(cam_id) % self._num_shards
++
++    def start(self) -> None:
++        if self._started:
+             return
+-        self._process = multiprocessing.Process(
+-            target=analytics_worker_proc,
+-            args=(self._task_queue, self._ui_task_queue, self._viewer_dict),
+-            daemon=True,
+-            name="AnalyticsProcess",
++        self._started = True
++        for idx in range(self._num_shards):
++            p = multiprocessing.Process(
++                target=_analytics_shard_proc,
++                args=(
++                    idx,
++                    self._task_queues[idx],
++                    self._ui_signal_queue,
++                    self._viewer_array,
++                    self._cam_slot_map,
++                ),
++                daemon=True,
++                name=f"AnalyticsShard-{idx}",
++            )
++            p.start()
++            self._processes.append(p)
++        logger.info(
++            "AnalyticsPool started with %d shards", self._num_shards,
+         )
+-        self._process.start()
+ 
+-    def stop(self):
+-        if self._process:
++    def stop(self) -> None:
++        for q in self._task_queues:
++            try:
++                q.put_nowait(None)
++            except Exception:
++                pass
++        for p in self._processes:
+             try:
+-                self._task_queue.put(None)
+-                self._process.join(timeout=2.0)
++                p.join(timeout=2.0)
+             except Exception:
+                 pass
+-            if self._process.is_alive():
+-                self._process.terminate()
+-            self._process = None
++            if p.is_alive():
++                p.terminate()
++        self._processes.clear()
++        self._started = False
++
++    def register_camera(self, cam_id: str, slot_idx: int) -> None:
++        self._cam_slot_map[cam_id] = slot_idx
++
++    def update_config(self, cam_id: str, slot_idx: int, zones) -> None:
++        self.register_camera(cam_id, slot_idx)
++        q = self._task_queues[self._shard_for(cam_id)]
++        try:
++            q.put_nowait(("CONFIG", cam_id, slot_idx, zones))
++        except queue.Full:
++            logger.warning("Analytics shard %d full, dropping CONFIG for %s",
++                           self._shard_for(cam_id), cam_id)
+ 
+-    def submit_data(self, cam_id, frame, detections, ts, inf_ms, fps):
++    def remove_camera(self, cam_id: str) -> None:
++        q = self._task_queues[self._shard_for(cam_id)]
+         try:
+-            self._task_queue.put_nowait(("DATA", cam_id, frame, detections, ts, inf_ms, fps))
++            q.put_nowait(("REMOVE", cam_id))
+         except queue.Full:
+             pass
++        self._cam_slot_map.pop(cam_id, None)
+ 
+-    def update_config(self, cam_id, zones):
+-        """Update zone configs in the background process."""
++    def submit_data(
++        self,
++        cam_id: str,
++        detections: list,
++        frame_w: int,
++        frame_h: int,
++        ts: float,
++        inf_ms: float,
++        fps: float,
++    ) -> None:
++        q = self._task_queues[self._shard_for(cam_id)]
+         try:
+-            # We must be careful about passing Pydantic objects or complex classes.
+-            # config_store already provides ZoneConfig objects. 
+-            self._task_queue.put_nowait(("CONFIG", cam_id, zones))
++            q.put_nowait((
++                "DATA", cam_id, detections, frame_w, frame_h, ts, inf_ms, fps,
++            ))
+         except queue.Full:
++            # Drop on overload — backpressure does not propagate upstream
++            # because the Voyager iter thread MUST stay live. A drop here
++            # only loses one cycle of analytics; trackers tolerate gaps.
+             pass
+diff --git a/edge_agent/pipeline/camera_stream.py b/edge_agent/pipeline/camera_stream.py
+index 0db7228..17b14d1 100644
+--- a/edge_agent/pipeline/camera_stream.py
++++ b/edge_agent/pipeline/camera_stream.py
+@@ -1,9 +1,13 @@
+-"""
+-CameraStream: per-camera pipeline orchestrator for vehicle detection.
++"""CameraStream: per-camera pipeline orchestrator for vehicle detection.
++
++After the multiprocess refactor, this class is intentionally thin:
+ 
+-Voyager SDK pipeline (Axelera edge):
+-  VoyagerEngine (GStreamer VA-API decode on iGPU + AIPU inference)
+-    → _on_frame callback → Track → Analytics → Publish (1 Hz)
++  * Owns the lazy ``VideoDecoder`` (only spun up if Voyager goes stale).
++  * Holds the current zone config, source URL, and viewer counter slot.
++  * On Voyager callbacks, fans the small payload out to:
++      - the AnalyticsPool (no pixels, just dets + dimensions)
++      - nothing else; pixels travel via the per-camera SharedMemory slot
++        that the Voyager engine writes directly.
+ """
+ 
+ from __future__ import annotations
+@@ -12,178 +16,155 @@ import logging
+ import threading
+ import time
+ from collections import deque
++from typing import Optional
+ 
+-import cv2
+ import numpy as np
+ 
+ from edge_agent import config as cfg
+-from edge_agent.pipeline.ocsort import OCSORTTracker
+-from edge_agent.pipeline.video_decoder import VideoDecoder
+-from edge_agent.pipeline.vehicle_analytics import VehicleZoneAnalytics
++from edge_agent.pipeline.video_decoder import VideoDecoder, tcp_preflight
+ from edge_agent.schemas import ZoneConfig
+ from rtsp_utils import normalize_rtsp_url
+ 
+ logger = logging.getLogger(__name__)
+ 
+-# Colors by vehicle type name (BGR)
+-VEHICLE_COLORS = {
+-    "car": (255, 160, 50),         # blue-ish
+-    "motorcycle": (0, 220, 255),   # yellow
+-    "bus": (50, 200, 50),          # green
+-    "truck": (50, 100, 255),       # orange
+-}
+-DEFAULT_COLOR = (200, 200, 200)
+-
+ 
+ class CameraStream:
+-    """
+-    Manages the full per-camera pipeline for vehicle detection.
+-    Zones can be updated hot (no restart needed).
+-    """
++    """Per-camera glue between Voyager, analytics shards, and the viewer counter."""
+ 
+     def __init__(
+         self,
+         camera_id: str,
+         source_url: str,
+         zones: list[ZoneConfig],
+-        engine,       # VoyagerEngine
+-        mqtt_pub,     # MQTTPublisher
+-        ui_renderer,  # UIRenderer
+-        analytics_worker, # AnalyticsWorker
+-        viewer_dict,  # Shared dict
++        slot_idx: int,
++        engine,                   # VoyagerEngine
++        analytics_pool,           # AnalyticsPool
++        viewer_array,             # multiprocessing.Array of int counts
+     ):
+         self._camera_id = camera_id
+         self._source_url = normalize_rtsp_url(source_url)
++        self._slot_idx = slot_idx
+         self._engine = engine
+-        self._mqtt_pub = mqtt_pub
+-        self._ui_renderer = ui_renderer
+-        self._analytics_worker = analytics_worker
+-        self._viewer_dict = viewer_dict
++        self._analytics_pool = analytics_pool
++        self._viewer_array = viewer_array
++
+         self._fallback_decoder = VideoDecoder(self._source_url, camera_id)
+ 
+         self._zones_lock = threading.Lock()
+-        self._current_zones = zones
++        self._current_zones = list(zones)
+ 
+         self._running = False
+         self._errored = False
+         self._voyager_started = False
+         self._startup_lock = threading.Lock()
+-        self._retry_thread: threading.Thread | None = None
++        self._retry_thread: Optional[threading.Thread] = None
+         self._started_ts: float = 0.0
+ 
+-        # FPS tracking
+         self._frame_times: deque[float] = deque(maxlen=30)
+-        self._last_publish_ts: dict[str, float] = {}
+-        self._last_annotate_ts: float = 0.0
+         self._last_input_ts: float = 0.0
++        self._last_voyager_check_ts: float = 0.0
+ 
+-        # Latest annotated state (for live view)
+-        self._last_tracked: list = []
+-        self._last_detections: list[tuple[float, float, float, float, float, int]] = []
+-        self._last_det_classes: dict[int, int] = {}  # track_id -> class_id
+-        self._track_first_seen_ts: dict[int, float] = {}
+-        self._track_last_seen_ts: dict[int, float] = {}
+-        self._state_lock = threading.Lock()
+-        self._last_frame_annotated: bytes | None = None
+-        self._last_annotated_input_ts: float = 0.0
+-        self._annotated_lock = threading.Lock()
+-
+-        # Viewer refcount
+-        self._viewers: int = 0
+-        self._viewers_lock = threading.Lock()
+-
+-        # Detect engine type
+         from edge_agent.pipeline.voyager_engine import VoyagerEngine
+         self._use_voyager = isinstance(engine, VoyagerEngine)
+ 
++    # ------------------------------------------------------------------
++    # Lifecycle
++    # ------------------------------------------------------------------
++
+     def start(self) -> None:
+         self._running = True
+         self._started_ts = time.time()
+-        # Keep a decoder-side snapshot path alive for preview/status even when
+-        # the primary Voyager stream is not yielding frames for a source.
+-        self._fallback_decoder.start()
++
++        # Cheap TCP preflight — sub-second instead of opening a full RTSP session.
+         if cfg.ENABLE_SOURCE_PREFLIGHT:
+-            preflight_timeout_s = self._preflight_timeout_s()
+-            ready = self._fallback_decoder.wait_until_ready(preflight_timeout_s)
+-            if not ready:
++            ok = tcp_preflight(self._source_url, cfg.PREFLIGHT_TCP_TIMEOUT_S)
++            if not ok:
+                 if self._use_voyager and self._is_local_source():
+                     logger.warning(
+-                        "[%s] Local source not ready after %.1fs; waiting in background for %s",
+-                        self._camera_id,
+-                        preflight_timeout_s,
+-                        self._source_url,
++                        "[%s] TCP preflight failed; will retry in background for %s",
++                        self._camera_id, self._source_url,
+                     )
+                     self._schedule_local_source_retry()
+                 else:
+                     self._errored = True
+                     logger.error(
+-                        "[%s] Source preflight failed after %.1fs; skipping Voyager startup for %s",
+-                        self._camera_id,
+-                        preflight_timeout_s,
+-                        self._source_url,
++                        "[%s] TCP preflight failed (%.1fs) for %s; skipping Voyager startup",
++                        self._camera_id, cfg.PREFLIGHT_TCP_TIMEOUT_S, self._source_url,
+                     )
+                 return
+         self._errored = False
+-        self._analytics_worker.update_config(self._camera_id, self._current_zones)
++        self._publish_zone_config()
+         self._start_voyager_stream()
+-        logger.info("[%s] Started (source=%s, voyager=%s)",
+-                    self._camera_id, self._source_url, self._use_voyager)
++        logger.info(
++            "[%s] Started (source=%s, voyager=%s, zones=%d)",
++            self._camera_id, self._source_url, self._use_voyager,
++            len(self._current_zones),
++        )
+ 
+     def stop(self) -> None:
+         self._running = False
+         self._fallback_decoder.stop()
+         if self._use_voyager:
+             self._engine.remove_stream(self._camera_id)
++        self._analytics_pool.remove_camera(self._camera_id)
+         logger.info("[%s] Stopped", self._camera_id)
+ 
++    @property
++    def slot_idx(self) -> int:
++        return self._slot_idx
++
++    @property
++    def zone_count(self) -> int:
++        return len(self._current_zones)
++
++    # ------------------------------------------------------------------
++    # Zone config
++    # ------------------------------------------------------------------
++
+     def update_zones(self, zones: list[ZoneConfig]) -> None:
+-        """Replace the full zone list."""
+         with self._zones_lock:
+-            self._current_zones = zones
+-        self._analytics_worker.update_config(self._camera_id, zones)
++            self._current_zones = list(zones)
++        self._publish_zone_config()
+         logger.info("[%s] Zones updated: %s", self._camera_id,
+                     [z.zone_id for z in zones])
+ 
+     def upsert_zone(self, zone_config: ZoneConfig) -> None:
+-        """Add or update a single zone without touching others."""
+         with self._zones_lock:
+-            # Find and replace in current_zones
+             new_zones = [z for z in self._current_zones if z.zone_id != zone_config.zone_id]
+             new_zones.append(zone_config)
+             self._current_zones = new_zones
+-        self._analytics_worker.update_config(self._camera_id, self._current_zones)
++            zones_snapshot = list(new_zones)
++        self._analytics_pool.update_config(self._camera_id, self._slot_idx, zones_snapshot)
+         logger.info("[%s] Zone upserted: %s", self._camera_id, zone_config.zone_id)
+ 
+-    def get_snapshot(self) -> bytes | None:
+-        """Return latest frame as JPEG bytes."""
+-        frame = self._get_latest_frame_np()
+-        if frame is None:
+-            return None
+-        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+-        return buf.tobytes() if ok else None
+-
+-    def get_annotated_snapshot(self) -> bytes | None:
+-        """Return latest frame annotated with bboxes, track IDs, and zone polygons."""
+-        res = self._ui_renderer.get_result(self._camera_id)
+-        if res is None:
+-            return None
+-        jpeg, ts = res
+-        # Check if the rendered frame is too stale (e.g. camera went offline)
+-        if (time.time() - ts) > cfg.LIVE_FRAME_STALE_S:
+-            return None
+-        return jpeg
++    def _publish_zone_config(self) -> None:
++        with self._zones_lock:
++            zones_snapshot = list(self._current_zones)
++        self._analytics_pool.update_config(
++            self._camera_id, self._slot_idx, zones_snapshot,
++        )
++
++    # ------------------------------------------------------------------
++    # Viewer counting
++    # ------------------------------------------------------------------
+ 
+     def add_viewer(self) -> None:
+-        count = self._viewer_dict.get(self._camera_id, 0)
+-        self._viewer_dict[self._camera_id] = count + 1
++        with self._viewer_array.get_lock():
++            self._viewer_array[self._slot_idx] += 1
+ 
+     def remove_viewer(self) -> None:
+-        count = self._viewer_dict.get(self._camera_id, 0)
+-        self._viewer_dict[self._camera_id] = max(0, count - 1)
++        with self._viewer_array.get_lock():
++            v = self._viewer_array[self._slot_idx]
++            if v > 0:
++                self._viewer_array[self._slot_idx] = v - 1
+ 
+     @property
+     def has_viewers(self) -> bool:
+-        return self._viewer_dict.get(self._camera_id, 0) > 0
++        return self._viewer_array[self._slot_idx] > 0
++
++    # ------------------------------------------------------------------
++    # Health
++    # ------------------------------------------------------------------
+ 
+     def mark_errored(self) -> None:
+         self._errored = True
+@@ -194,23 +175,19 @@ class CameraStream:
+ 
+     @property
+     def has_fresh_inference(self) -> bool:
+-        """Whether Voyager has produced a recent frame for this camera."""
+         if not self._voyager_started or not self._last_input_ts:
+             return False
+         return (time.time() - self._last_input_ts) <= cfg.INFERENCE_HEALTH_STALE_S
+ 
+     @property
+     def health_problem(self) -> bool:
+-        """True when the camera should count as an inference issue in heartbeat."""
+         if not self._running:
+             return True
+         if self.has_fresh_inference:
+             return False
+-
+-        # Give newly-added cameras a short grace period before calling them bad.
+-        if self._started_ts and (time.time() - self._started_ts) < cfg.INFERENCE_STARTUP_GRACE_S:
++        if (self._started_ts and
++                (time.time() - self._started_ts) < cfg.INFERENCE_STARTUP_GRACE_S):
+             return False
+-
+         return self._errored or self._use_voyager
+ 
+     @property
+@@ -223,59 +200,72 @@ class CameraStream:
+         return 1.0 / avg_interval if avg_interval > 0 else 0.0
+ 
+     # ------------------------------------------------------------------
+-    # Voyager callback
++    # Snapshots (HTTP read-path)
++    # ------------------------------------------------------------------
++
++    def get_snapshot_frame(self) -> Optional[np.ndarray]:
++        """Return the freshest raw frame, falling back to the lazy decoder."""
++        if self._use_voyager:
++            frame = self._engine.get_snapshot_frame(self._camera_id)
++            if frame is not None:
++                if self._is_local_source():
++                    self._errored = False
++                # Voyager is alive — make sure we're not running the fallback.
++                if self._fallback_decoder.is_running:
++                    self._fallback_decoder.stop()
++                return frame
++
++        # Voyager has not delivered a fresh frame; spin up the fallback if
++        # it's not already running. Only do this for HTTP requests; the
++        # analytics path never touches it.
++        if not self._fallback_decoder.is_running:
++            self._fallback_decoder.start()
++        return self._fallback_decoder.get_snapshot()
++
++    # ------------------------------------------------------------------
++    # Voyager callback (called from the iter thread)
+     # ------------------------------------------------------------------
+ 
+-    def _on_frame(
++    def on_frame(
+         self,
+-        frame_bgr: np.ndarray,
+-        detections: list[tuple[float, float, float, float, float, int]],
++        detections: list,
+         frame_w: int,
+         frame_h: int,
++        ts: float,
++        inf_ms: float,
++        fps: float,
+     ) -> None:
++        """Cheap fan-out: the iter thread MUST stay fast.
++
++        The frame pixels are already in SharedMemory by the time Voyager
++        invokes this callback — we only forward the small payload to the
++        analytics shard.
+         """
+-        Callback from VoyagerEngine.
+-        Delegates all work to the AnalyticsWorker process.
+-        """
+-        ts = time.time()
+         self._frame_times.append(ts)
+         self._last_input_ts = ts
+         self._errored = False
+-        inf_ms = self._engine.avg_inf_ms
+-        fps = self.inf_fps
+-
+-        # Simply push to the worker queue. 
+-        # This is the "Ingestor" hand-off.
+-        self._analytics_worker.submit_data(
+-            self._camera_id, frame_bgr, detections, ts, inf_ms, fps
++        self._analytics_pool.submit_data(
++            self._camera_id, detections, frame_w, frame_h, ts, inf_ms, fps,
+         )
+ 
+-
+-
++    # ------------------------------------------------------------------
++    # Internal helpers
++    # ------------------------------------------------------------------
+ 
+     def _is_local_source(self) -> bool:
+         source = self._source_url.lower()
+         return "localhost" in source or "127.0.0.1" in source
+ 
+-    def _preflight_timeout_s(self) -> float:
+-        if self._is_local_source():
+-            return cfg.LOCAL_SOURCE_PREFLIGHT_S
+-        return cfg.STARTUP_SOURCE_PREFLIGHT_S
+-
+     def _start_voyager_stream(self) -> None:
+         if not self._use_voyager:
+             return
+         with self._startup_lock:
+             if self._voyager_started or not self._running:
+                 return
+-            if not cfg.KEEP_FALLBACK_DECODER_OPEN:
+-                # Free the preflight RTSP session before Voyager opens its own.
+-                # Some cameras/NVRs only tolerate a single live client.
+-                self._fallback_decoder.stop()
+             self._engine.add_stream(
+                 self._camera_id,
+                 self._source_url,
+-                self._on_frame,
++                self.on_frame,
+                 error_callback=self.mark_errored,
+             )
+             self._voyager_started = True
+@@ -293,40 +283,27 @@ class CameraStream:
+     def _retry_local_source_start(self) -> None:
+         deadline = time.time() + cfg.LOCAL_SOURCE_RETRY_WINDOW_S
+         while self._running and not self._voyager_started and time.time() < deadline:
+-            ready = self._fallback_decoder.wait_until_ready(1.0)
+-            if not ready:
++            time.sleep(1.0)
++            if not tcp_preflight(self._source_url, cfg.PREFLIGHT_TCP_TIMEOUT_S):
+                 continue
+             self._errored = False
+             logger.info(
+-                "[%s] Local source became ready; starting Voyager pipeline for %s",
+-                self._camera_id,
+-                self._source_url,
++                "[%s] Local source reachable; starting Voyager pipeline for %s",
++                self._camera_id, self._source_url,
+             )
++            self._publish_zone_config()
+             self._start_voyager_stream()
+             if self._voyager_started:
+-                logger.info("[%s] Started (source=%s, zones=%d, voyager=%s)",
+-                            self._camera_id, self._source_url,
+-                            len(self._analytics), self._use_voyager)
++                logger.info(
++                    "[%s] Started (source=%s, zones=%d, voyager=%s)",
++                    self._camera_id, self._source_url,
++                    len(self._current_zones), self._use_voyager,
++                )
+             return
+ 
+         if self._running and not self._voyager_started:
+             self._errored = True
+             logger.error(
+-                "[%s] Local source never became ready within %.1fs; leaving camera offline for %s",
+-                self._camera_id,
+-                cfg.LOCAL_SOURCE_RETRY_WINDOW_S,
+-                self._source_url,
++                "[%s] Local source never became ready within %.1fs; leaving offline (%s)",
++                self._camera_id, cfg.LOCAL_SOURCE_RETRY_WINDOW_S, self._source_url,
+             )
+-
+-
+-    def _get_latest_frame_np(self) -> np.ndarray | None:
+-        """Return the freshest available raw frame for live preview rendering."""
+-        if self._use_voyager:
+-            frame = self._engine.get_snapshot_frame(self._camera_id)
+-        else:
+-            frame = None
+-        if frame is None:
+-            frame = self._fallback_decoder.get_snapshot()
+-        if frame is not None and self._is_local_source():
+-            self._errored = False
+-        return frame
+diff --git a/edge_agent/pipeline/ocsort.py b/edge_agent/pipeline/ocsort.py
+index 9b1df12..0d16c2a 100644
+--- a/edge_agent/pipeline/ocsort.py
++++ b/edge_agent/pipeline/ocsort.py
+@@ -93,7 +93,7 @@ _track_id_counter = 0
+ class OCSTrack:
+     """Single object track with observation history for OC-SORT."""
+ 
+-    def __init__(self, bbox_xyxy: np.ndarray, conf: float):
++    def __init__(self, bbox_xyxy: np.ndarray, conf: float, class_id: int = -1):
+         global _track_id_counter
+         _track_id_counter += 1
+         self.track_id: int = _track_id_counter
+@@ -107,6 +107,7 @@ class OCSTrack:
+         self.mean: np.ndarray | None = None
+         self.cov: np.ndarray | None = None
+         self.conf = conf
++        self.class_id: int = int(class_id)
+         self.state = _NEW
+         self.frame_id = 0
+         self.start_frame = 0
+@@ -149,7 +150,8 @@ class OCSTrack:
+             self.mean, self.cov = _kf.predict(self.mean, self.cov)
+             self.time_since_update += 1
+ 
+-    def update(self, bbox_xyxy: np.ndarray, conf: float, frame_id: int) -> None:
++    def update(self, bbox_xyxy: np.ndarray, conf: float, frame_id: int,
++               class_id: int = -1) -> None:
+         cx = (bbox_xyxy[0] + bbox_xyxy[2]) / 2
+         cy = (bbox_xyxy[1] + bbox_xyxy[3]) / 2
+         w = bbox_xyxy[2] - bbox_xyxy[0]
+@@ -162,6 +164,8 @@ class OCSTrack:
+ 
+         self.mean, self.cov = _kf.update(self.mean, self.cov, meas)
+         self.conf = conf
++        if class_id >= 0:
++            self.class_id = int(class_id)
+         self.state = _TRACKED
+         self.frame_id = frame_id
+         self.time_since_update = 0
+@@ -267,7 +271,7 @@ def _linear_assignment(cost_matrix: np.ndarray, thresh: float):
+ # OC-SORT Tracker
+ # --------------------------------------------------------------------------
+ 
+-TrackedDetection = tuple[int, float, float, float, float, float]
++TrackedDetection = tuple[int, float, float, float, float, float, int]
+ 
+ 
+ class OCSORTTracker:
+@@ -307,7 +311,8 @@ class OCSORTTracker:
+             self._age_tracks()
+             return self._active_outputs()
+ 
+-        dets = np.array([[x1, y1, x2, y2, c] for x1, y1, x2, y2, c, _ in detections],
++        dets = np.array([[x1, y1, x2, y2, c, cls]
++                         for x1, y1, x2, y2, c, cls in detections],
+                         dtype=float)
+         high_mask = dets[:, 4] >= self.high_thresh
+         low_mask = (dets[:, 4] >= self.low_thresh) & ~high_mask
+@@ -328,7 +333,10 @@ class OCSORTTracker:
+ 
+         for ti, di in matches1:
+             track = all_tracks[ti]
+-            track.update(high_dets[di, :4], high_dets[di, 4], self._frame_id)
++            track.update(
++                high_dets[di, :4], high_dets[di, 4], self._frame_id,
++                class_id=int(high_dets[di, 5]),
++            )
+             if track in self._lost:
+                 re_found.append(track)
+             else:
+@@ -342,7 +350,10 @@ class OCSORTTracker:
+             matches2, unm_tracks2, _ = self._match(low_dets, unm_tracked_tracks)
+             for ti, di in matches2:
+                 track = unm_tracked_tracks[ti]
+-                track.update(low_dets[di, :4], low_dets[di, 4], self._frame_id)
++                track.update(
++                    low_dets[di, :4], low_dets[di, 4], self._frame_id,
++                    class_id=int(low_dets[di, 5]),
++                )
+                 activated.append(track)
+             unm_tracked_tracks = [unm_tracked_tracks[i] for i in unm_tracks2]
+ 
+@@ -359,7 +370,10 @@ class OCSORTTracker:
+         new_tracks: list[OCSTrack] = []
+         for di in unm_dets1:
+             if high_dets[di, 4] >= self.high_thresh:
+-                t = OCSTrack(high_dets[di, :4], high_dets[di, 4])
++                t = OCSTrack(
++                    high_dets[di, :4], high_dets[di, 4],
++                    class_id=int(high_dets[di, 5]),
++                )
+                 t.activate(self._frame_id)
+                 new_tracks.append(t)
+ 
+@@ -374,6 +388,7 @@ class OCSORTTracker:
+         return self._active_outputs()
+ 
+     def _match(self, dets: np.ndarray, tracks: list[OCSTrack]):
++        # dets carry an extra class_id column now; we still match on bbox+conf.
+         if len(dets) == 0 or len(tracks) == 0:
+             return [], list(range(len(tracks))), list(range(len(dets)))
+ 
+@@ -428,7 +443,8 @@ class OCSORTTracker:
+             if t.state == _TRACKED and t.hit_count >= self.MIN_HITS:
+                 b = t.bbox_xyxy
+                 out.append((t.track_id, float(b[0]), float(b[1]),
+-                            float(b[2]), float(b[3]), float(t.conf)))
++                            float(b[2]), float(b[3]), float(t.conf),
++                            int(t.class_id)))
+         return out
+ 
+     def reset(self) -> None:
+diff --git a/edge_agent/pipeline/ui_renderer.py b/edge_agent/pipeline/ui_renderer.py
+index 8b4ca98..12a014a 100644
+--- a/edge_agent/pipeline/ui_renderer.py
++++ b/edge_agent/pipeline/ui_renderer.py
+@@ -1,208 +1,323 @@
+-"""
+-UIRenderer — Dedicated multiprocessing worker for UI annotation.
+-Moves CPU-bound cv2 drawing out of the main analytics process.
++"""UIRenderer — SharedMemory-driven annotated preview encoder.
++
++The UI worker:
++  * Reads the latest frame for a camera from a SharedMemory FrameSlot.
++  * Draws a single cached zone overlay + per-detection bboxes/labels.
++  * Encodes via TurboJPEG when available, else cv2.imencode.
++  * Writes the JPEG bytes to a SharedMemory JPEGSlot.
++
++It receives small "wake" signals from the analytics shards — never frame
++pixels — so the queue payload is tiny and the queue depth (10) is more
++than enough to absorb bursts.
+ """
+ 
+ from __future__ import annotations
+ 
+ import logging
+ import multiprocessing
++import os
+ import queue
+ import time
++from typing import Optional
+ 
+ import cv2
+ import numpy as np
+ 
+ from edge_agent import config as cfg
++from edge_agent.pipeline.shm_buffer import FrameSlot, JPEGSlot
+ 
+ logger = logging.getLogger(__name__)
+ 
++
+ # Colors by vehicle type name (BGR)
+ VEHICLE_COLORS = {
+-    "car": (255, 160, 50),         # blue-ish
+-    "motorcycle": (0, 220, 255),   # yellow
+-    "bus": (50, 200, 50),          # green
+-    "truck": (50, 100, 255),       # orange
++    "car": (255, 160, 50),
++    "motorcycle": (0, 220, 255),
++    "bus": (50, 200, 50),
++    "truck": (50, 100, 255),
+ }
+ DEFAULT_COLOR = (200, 200, 200)
++ZONE_COLOR = (0, 200, 255)
++ZONE_ALPHA = 0.15
+ 
+ 
+-def renderer_worker(task_queue: multiprocessing.JoinableQueue, result_dict: dict):
+-    """
+-    Entry point for the separate UI process.
+-    Listens for RenderTasks and stores JPEG results in shared memory.
+-    """
+-    logger.info("UIRenderer process started.")
+-    
+-    # Internal cache for zone polygons to avoid re-calculating sx/sy every frame
+-    zone_cache = {} # camera_id -> {zone_id: pts}
++# --------------------------------------------------------------------------
++# Encoder abstraction — TurboJPEG with OpenCV fallback
++# --------------------------------------------------------------------------
+ 
+-    while True:
+-        try:
+-            task = task_queue.get(timeout=1.0)
+-        except queue.Empty:
+-            continue
++class _JPEGEncoder:
++    def __init__(self, quality: int = 70):
++        self._quality = quality
++        self._tj = None
++        if cfg.USE_TURBOJPEG:
++            try:
++                from turbojpeg import TurboJPEG, TJPF_BGR  # type: ignore
++                self._tj = TurboJPEG()
++                self._tj_pixel_format = TJPF_BGR
++                logger.info("UIRenderer: using TurboJPEG (quality=%d)", quality)
++            except Exception as e:
++                logger.info(
++                    "UIRenderer: TurboJPEG unavailable (%s); using cv2.imencode",
++                    e,
++                )
+ 
+-        if task is None: # Shutdown signal
+-            task_queue.task_done()
+-            break
++    def encode(self, frame: np.ndarray) -> Optional[bytes]:
++        if self._tj is not None:
++            try:
++                return self._tj.encode(
++                    frame,
++                    quality=self._quality,
++                    pixel_format=self._tj_pixel_format,
++                )
++            except Exception:
++                logger.exception("TurboJPEG encode failed; falling back to cv2")
++                self._tj = None  # don't keep retrying
++        ok, buf = cv2.imencode(
++            ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), self._quality]
++        )
++        if not ok:
++            return None
++        return buf.tobytes()
+ 
+-        try:
+-            (
+-                camera_id,
+-                frame_bgr,
+-                detections,
+-                tracked,
+-                det_classes,
+-                zones_polygons, # List of (zone_id, pts)
+-                dwell_labels,   # Dict of track_id -> label
+-                hud_data,       # (inf_ms, fps)
+-                ts,
+-            ) = task
+ 
+-            # 1. Draw Annotations
+-            annotated = _draw_annotations(
+-                frame_bgr,
+-                detections,
+-                tracked,
+-                det_classes,
+-                zones_polygons,
+-                dwell_labels,
+-                hud_data,
+-            )
++# --------------------------------------------------------------------------
++# Drawing helpers — overlay built once per zone-config change
++# --------------------------------------------------------------------------
+ 
+-            # 2. Encode to JPEG
+-            ok, buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 70])
+-            if ok:
+-                # Store result in shared dictionary
+-                # Use a tuple (jpeg, timestamp) so the reader knows if it is fresh
+-                result_dict[camera_id] = (buf.tobytes(), ts)
++class _ZoneOverlayCache:
++    """One pre-rendered zone overlay (BGR + alpha mask) per (cam, frame_size)."""
+ 
+-        except Exception as e:
+-            logger.error(f"UIRenderer error for {camera_id if 'camera_id' in locals() else 'unknown'}: {e}")
+-        finally:
+-            task_queue.task_done()
++    def __init__(self):
++        # cam_id -> (zones_signature, frame_w, frame_h, overlay_bgr)
++        self._cache: dict[str, tuple] = {}
++
++    def get(
++        self,
++        cam_id: str,
++        zones_canvas: list,
++        frame_w: int,
++        frame_h: int,
++    ) -> Optional[np.ndarray]:
++        sig = tuple((zid, len(p)) for zid, p in zones_canvas)
++        cached = self._cache.get(cam_id)
++        if cached is not None:
++            cached_sig, cw, ch, overlay = cached
++            if cached_sig == sig and cw == frame_w and ch == frame_h:
++                return overlay
++
++        if not zones_canvas:
++            self._cache[cam_id] = (sig, frame_w, frame_h, None)
++            return None
+ 
+-    logger.info("UIRenderer process exiting.")
++        sx = frame_w / cfg.CANVAS_W
++        sy = frame_h / cfg.CANVAS_H
++        overlay = np.zeros((frame_h, frame_w, 3), dtype=np.uint8)
++        for _zid, poly in zones_canvas:
++            if not poly:
++                continue
++            arr = np.array(poly, dtype=np.float32).reshape(-1, 1, 2)
++            arr[:, 0, 0] *= sx
++            arr[:, 0, 1] *= sy
++            poly_int = arr.astype(np.int32)
++            cv2.fillPoly(overlay, [poly_int], ZONE_COLOR)
++            cv2.polylines(overlay, [poly_int], True, ZONE_COLOR, 3)
++        self._cache[cam_id] = (sig, frame_w, frame_h, overlay)
++        return overlay
++
++    def invalidate(self, cam_id: str) -> None:
++        self._cache.pop(cam_id, None)
+ 
+ 
+ def _draw_annotations(
+     frame: np.ndarray,
+-    detections: list,
+     tracked: list,
+-    det_classes: dict,
+-    zones_polygons: list,
+-    dwell_labels: dict,
++    zone_overlay: Optional[np.ndarray],
+     hud_data: tuple,
+ ) -> np.ndarray:
+-    """CPU-bound drawing logic using OpenCV."""
+-    fh, fw = frame.shape[:2]
++    """Draw zone overlay + bboxes + HUD onto ``frame`` in-place."""
+     inf_ms, fps = hud_data
+ 
+-    # 1. Zone Polygons
+-    for zone_id, pts in zones_polygons:
+-        # pts are already scaled for the current frame size by the sender
+-        color = (0, 200, 255)  # yellow-orange
+-        cv2.polylines(frame, [pts], True, color, 3)
+-        overlay = frame.copy()
+-        cv2.fillPoly(overlay, [pts], color)
+-        cv2.addWeighted(overlay, 0.15, frame, 0.85, 0, frame)
+-
+-    # 2. Bounding Boxes & Tracks
+-    for x1, y1, x2, y2, conf, cls_id in detections:
++    if zone_overlay is not None:
++        cv2.addWeighted(zone_overlay, ZONE_ALPHA, frame, 1.0 - ZONE_ALPHA, 0, frame)
++
++    for item in tracked:
++        track_id, x1, y1, x2, y2, conf = item[:6]
++        cls_id = item[6] if len(item) > 6 else cfg.DEFAULT_VEHICLE_CLASS_ID
+         x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+         cls_name = cfg.VEHICLE_CLASS_NAMES.get(cls_id, "vehicle")
+         color = VEHICLE_COLORS.get(cls_name, DEFAULT_COLOR)
+-        
+-        # Match track_id for dwell label
+-        track_id = _match_track_id((x1, y1, x2, y2), tracked)
+-        dwell_label = dwell_labels.get(track_id) if track_id is not None else None
+ 
+         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+-        label = cls_name
+-        if track_id is not None:
+-            label = f"{label} #{int(track_id)}"
+-        if dwell_label:
+-            label = f"{label} {dwell_label}"
+-            
++        label = f"{cls_name} #{int(track_id)}"
+         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+         label_y1 = max(0, y1 - th - 8)
+         label_y2 = max(th + 8, y1)
+         cv2.rectangle(frame, (x1, label_y1), (x1 + tw + 8, label_y2), color, -1)
+         cv2.putText(
+             frame, label, (x1 + 4, max(th + 2, y1 - 6)),
+-            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2
++            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2,
+         )
+ 
+-    # 3. HUD
+-    hud = (f"Detections: {len(detections)}  Tracked: {len(tracked)}  FPS: {fps:.1f}  Inf: {inf_ms:.0f}ms")
++    hud = f"Tracked: {len(tracked)}  FPS: {fps:.1f}  Inf: {inf_ms:.0f}ms"
+     cv2.rectangle(frame, (0, 0), (len(hud) * 8 + 10, 22), (0, 0, 0), -1)
+     cv2.putText(
+         frame, hud, (5, 15),
+-        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1
++        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1,
+     )
+ 
+     return frame
+ 
+ 
+-def _match_track_id(det_bbox: tuple[int, int, int, int], tracked: list) -> int | None:
+-    dx1, dy1, dx2, dy2 = det_bbox
+-    best_iou = 0.0
+-    best_track_id: int | None = None
+-    det_area = max(1, (dx2 - dx1) * (dy2 - dy1))
+-    for track_id, tx1, ty1, tx2, ty2, _conf in tracked:
+-        inter_w = max(0, min(dx2, tx2) - max(dx1, tx1))
+-        inter_h = max(0, min(dy2, ty2) - max(dy1, ty1))
+-        inter = inter_w * inter_h
+-        if inter <= 0:
++def _maybe_downscale(frame: np.ndarray, max_w: int) -> np.ndarray:
++    h, w = frame.shape[:2]
++    if w <= max_w:
++        return frame
++    new_w = max_w
++    new_h = int(h * (max_w / w))
++    return cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
++
++
++# --------------------------------------------------------------------------
++# Worker process
++# --------------------------------------------------------------------------
++
++def _renderer_proc(
++    worker_idx: int,
++    task_queue: "multiprocessing.Queue",
++    frame_slots: dict,
++    jpeg_slots: dict,
++):
++    """One UI worker. Pulls render signals; reads frames from SHM."""
++    try:
++        os.nice(10)
++    except Exception:
++        pass
++
++    proc_logger = logging.getLogger(f"ui-renderer-{worker_idx}")
++    proc_logger.info(
++        "UIRenderer worker %d started (pid=%d, cams=%d)",
++        worker_idx, os.getpid(), len(frame_slots),
++    )
++
++    encoder = _JPEGEncoder(quality=cfg.LIVE_JPEG_QUALITY)
++    overlay_cache = _ZoneOverlayCache()
++
++    while True:
++        try:
++            task = task_queue.get(timeout=1.0)
++        except queue.Empty:
+             continue
+-        track_area = max(1, (tx2 - tx1) * (ty2 - ty1))
+-        union = det_area + track_area - inter
+-        iou = inter / union if union > 0 else 0.0
+-        if iou > best_iou:
+-            best_iou = iou
+-            best_track_id = int(track_id)
+-    return best_track_id if best_iou >= 0.25 else None
+ 
++        if task is None:
++            break
+ 
+-class UIRenderer:
+-    """Manages the lifecycle of the Renderer process from the main process."""
++        try:
++            (
++                cam_id,
++                tracked,
++                zone_polys_canvas,
++                (frame_w, frame_h),
++                hud_data,
++                ts,
++            ) = task
+ 
+-    def __init__(self):
+-        self._manager = multiprocessing.Manager()
+-        self._result_dict = self._manager.dict()
+-        self._task_queue = multiprocessing.JoinableQueue(maxsize=10)
+-        self._process = None
++            frame_slot: Optional[FrameSlot] = frame_slots.get(cam_id)
++            if frame_slot is None:
++                continue
++            frame, frame_ts = frame_slot.read()
++            if frame is None:
++                continue
+ 
+-    def start(self):
+-        if self._process and self._process.is_alive():
+-            return
+-        self._process = multiprocessing.Process(
+-            target=renderer_worker,
+-            args=(self._task_queue, self._result_dict),
+-            daemon=True,
+-            name="UIRendererProcess",
++            actual_h, actual_w = frame.shape[:2]
++
++            zone_overlay = overlay_cache.get(
++                cam_id, zone_polys_canvas, actual_w, actual_h,
++            )
++
++            annotated = _draw_annotations(
++                frame, tracked, zone_overlay, hud_data,
++            )
++            annotated = _maybe_downscale(annotated, cfg.LIVE_PREVIEW_MAX_W)
++
++            jpeg = encoder.encode(annotated)
++            if jpeg is None:
++                continue
++
++            jpeg_slot: Optional[JPEGSlot] = jpeg_slots.get(cam_id)
++            if jpeg_slot is not None:
++                jpeg_slot.write(jpeg, ts)
++
++        except Exception:
++            proc_logger.exception("UIRenderer worker %d error", worker_idx)
++
++    proc_logger.info("UIRenderer worker %d exiting", worker_idx)
++
++
++# --------------------------------------------------------------------------
++# Pool manager
++# --------------------------------------------------------------------------
++
++class UIRendererPool:
++    """Manages one or more UIRenderer worker processes.
++
++    A single shared task queue feeds all workers — any free worker grabs
++    the next render signal. With one viewer at a time in practice, a
++    single worker is plenty.
++    """
++
++    def __init__(self, num_workers: int = 1, queue_size: int = 32):
++        self._num_workers = max(1, int(num_workers))
++        self._task_queue: multiprocessing.Queue = multiprocessing.Queue(
++            maxsize=queue_size,
+         )
+-        self._process.start()
++        self._processes: list[multiprocessing.Process] = []
++        self._frame_slots: dict[str, FrameSlot] = {}
++        self._jpeg_slots: dict[str, JPEGSlot] = {}
++
++    @property
++    def task_queue(self) -> multiprocessing.Queue:
++        return self._task_queue
++
++    def register_camera(
++        self, cam_id: str, frame_slot: FrameSlot, jpeg_slot: JPEGSlot,
++    ) -> None:
++        self._frame_slots[cam_id] = frame_slot
++        self._jpeg_slots[cam_id] = jpeg_slot
++
++    def unregister_camera(self, cam_id: str) -> None:
++        self._frame_slots.pop(cam_id, None)
++        self._jpeg_slots.pop(cam_id, None)
+ 
+-    def stop(self):
+-        if self._process:
++    def start(self) -> None:
++        if self._processes:
++            return
++        for idx in range(self._num_workers):
++            p = multiprocessing.Process(
++                target=_renderer_proc,
++                args=(
++                    idx,
++                    self._task_queue,
++                    dict(self._frame_slots),
++                    dict(self._jpeg_slots),
++                ),
++                daemon=True,
++                name=f"UIRenderer-{idx}",
++            )
++            p.start()
++            self._processes.append(p)
++        logger.info("UIRendererPool started with %d worker(s)", self._num_workers)
++
++    def stop(self) -> None:
++        for _ in self._processes:
+             try:
+-                self._task_queue.put(None)
+-                self._process.join(timeout=2.0)
++                self._task_queue.put_nowait(None)
+             except Exception:
+                 pass
+-            if self._process.is_alive():
+-                self._process.terminate()
+-            self._process = None
+-
+-    def submit_task(self, task: tuple):
+-        """Submit a new render task. Non-blocking if queue full."""
+-        try:
+-            self._task_queue.put_nowait(task)
+-        except queue.Full:
+-            pass
+-
+-    def get_result(self, camera_id: str) -> tuple[bytes, float] | None:
+-        """Fetch the latest JPEG and its timestamp for a camera."""
+-        return self._result_dict.get(camera_id)
++        for p in self._processes:
++            try:
++                p.join(timeout=2.0)
++            except Exception:
++                pass
++            if p.is_alive():
++                p.terminate()
++        self._processes.clear()
+diff --git a/edge_agent/pipeline/vehicle_analytics.py b/edge_agent/pipeline/vehicle_analytics.py
+index 504573e..4d1a8cf 100644
+--- a/edge_agent/pipeline/vehicle_analytics.py
++++ b/edge_agent/pipeline/vehicle_analytics.py
+@@ -1,5 +1,4 @@
+-"""
+-Vehicle zone analytics: computes per-zone vehicle metrics from tracked detections.
++"""Vehicle zone analytics: computes per-zone vehicle metrics from tracked detections.
+ 
+ Metrics computed per zone:
+   - Vehicle count (total + by type)
+@@ -12,8 +11,8 @@ Metrics computed per zone:
+ 
+ from __future__ import annotations
+ 
+-import time
+ from collections import deque
++from typing import Optional
+ 
+ import cv2
+ import numpy as np
+@@ -31,11 +30,14 @@ class VehicleZoneAnalytics:
+     def __init__(self, zone_config: ZoneConfig, edge_id: str):
+         self._cfg = zone_config
+         self._edge_id = edge_id
++        self._zone_poly_canvas: Optional[np.ndarray] = None
++        # O(1) point-in-polygon test cache: keyed by (frame_w, frame_h)
++        self._mask_cache: dict[tuple[int, int], np.ndarray] = {}
+         self._update_polygons(zone_config)
+ 
+         # Per-track state
+         self._zone_entry: dict[int, float] = {}      # track_id -> entry_time
+-        self._zone_class: dict[int, int] = {}         # track_id -> class_id
++        self._zone_class: dict[int, int] = {}        # track_id -> class_id
+ 
+         # Cumulative counters
+         self._total_entered: int = 0
+@@ -55,24 +57,61 @@ class VehicleZoneAnalytics:
+         self._last_overcrowding_alert_ts: float = 0.0
+         self._last_overstay_alert_ts: dict[int, float] = {}
+ 
++    # ------------------------------------------------------------------
++    # Config
++    # ------------------------------------------------------------------
++
+     def update_config(self, zone_config: ZoneConfig) -> None:
+         """Hot-reload zone config (new polygons/thresholds)."""
+         self._cfg = zone_config
+         self._update_polygons(zone_config)
+ 
+     def _update_polygons(self, zone_cfg: ZoneConfig) -> None:
+-        """Parse polygon points from config."""
++        """Parse polygon points from config and reset the mask cache."""
+         zp = zone_cfg.zone_poly or []
+         self._zone_poly_canvas = (
+             np.array(zp, dtype=np.float32).reshape(-1, 1, 2)
+             if len(zp) >= 3 else None
+         )
+-        self._zone_poly = self._zone_poly_canvas
+-        self._cached_frame_size: tuple[int, int] = (0, 0)
++        # Invalidate per-frame-size mask cache; will be rebuilt lazily.
++        self._mask_cache.clear()
++
++    @property
++    def zone_poly_canvas(self) -> Optional[np.ndarray]:
++        """Polygon in canvas (Konva) coordinate space."""
++        return self._zone_poly_canvas
++
++    # ------------------------------------------------------------------
++    # Mask lookup — O(1) replacement for cv2.pointPolygonTest
++    # ------------------------------------------------------------------
++
++    def _get_mask(self, frame_w: int, frame_h: int) -> Optional[np.ndarray]:
++        if self._zone_poly_canvas is None:
++            return None
++        key = (frame_w, frame_h)
++        mask = self._mask_cache.get(key)
++        if mask is not None:
++            return mask
++
++        sx = frame_w / cfg.CANVAS_W
++        sy = frame_h / cfg.CANVAS_H
++        scaled = self._zone_poly_canvas.copy().astype(np.float64)
++        scaled[:, 0, 0] *= sx
++        scaled[:, 0, 1] *= sy
++        poly_int = scaled.astype(np.int32)
++
++        mask = np.zeros((frame_h, frame_w), dtype=np.uint8)
++        cv2.fillPoly(mask, [poly_int], 1)
++        self._mask_cache[key] = mask
++        return mask
++
++    # ------------------------------------------------------------------
++    # Per-frame analytics
++    # ------------------------------------------------------------------
+ 
+     def update(
+         self,
+-        tracked_dets: list[tuple[int, float, float, float, float, float, int]],
++        tracked_dets: list[tuple],
+         frame_w: int,
+         frame_h: int,
+         ts: float,
+@@ -85,20 +124,10 @@ class VehicleZoneAnalytics:
+         tracked_dets: [(track_id, x1, y1, x2, y2, conf, class_id), ...]
+         Returns a VehicleZoneMetrics object ready for MQTT publish.
+         """
+-        # Scale polygon from canvas space to actual frame space
+-        if (frame_w, frame_h) != self._cached_frame_size:
+-            sx = frame_w / cfg.CANVAS_W
+-            sy = frame_h / cfg.CANVAS_H
+-            if self._zone_poly_canvas is not None:
+-                self._zone_poly = self._zone_poly_canvas.copy()
+-                self._zone_poly[:, 0, 0] *= sx
+-                self._zone_poly[:, 0, 1] *= sy
+-            else:
+-                self._zone_poly = None
+-            self._cached_frame_size = (frame_w, frame_h)
++        mask = self._get_mask(frame_w, frame_h)
+ 
+         current_zone_ids: set[int] = set()
+-        current_classes: dict[int, int] = {}  # track_id -> class_id
++        current_classes: dict[int, int] = {}
+ 
+         for item in tracked_dets:
+             track_id, x1, y1, x2, y2, conf = item[:6]
+@@ -106,13 +135,15 @@ class VehicleZoneAnalytics:
+                 item[6] if len(item) > 6 else cfg.DEFAULT_VEHICLE_CLASS_ID
+             )
+ 
+-            # Use bbox center for polygon test
+-            cx = (x1 + x2) / 2.0
+-            cy = (y1 + y2) / 2.0
+-            pt = (float(cx), float(cy))
++            cx = (x1 + x2) * 0.5
++            cy = (y1 + y2) * 0.5
+ 
+-            in_zone = (self._zone_poly is not None and
+-                       cv2.pointPolygonTest(self._zone_poly, pt, False) >= 0)
++            in_zone = False
++            if mask is not None:
++                ix = int(cx)
++                iy = int(cy)
++                if 0 <= ix < frame_w and 0 <= iy < frame_h:
++                    in_zone = bool(mask[iy, ix])
+ 
+             if in_zone:
+                 current_zone_ids.add(track_id)
+@@ -141,39 +172,33 @@ class VehicleZoneAnalytics:
+ 
+         self._prev_zone_ids = current_zone_ids
+ 
+-        # --- Compute metrics ---
+         self._recent_counts.append(len(current_zone_ids))
+-        vehicle_count = int(np.median(list(self._recent_counts)))
++        vehicle_count = int(np.median(self._recent_counts))
+ 
+-        # Count by vehicle type
+         type_counts: dict[str, int] = {}
+         for tid in current_zone_ids:
+             cls_id = self._zone_class.get(tid, current_classes.get(tid, 2))
+             cls_name = cfg.VEHICLE_CLASS_NAMES.get(cls_id, f"class_{cls_id}")
+             type_counts[cls_name] = type_counts.get(cls_name, 0) + 1
+ 
+-        # Dwell times
+-        dwell_times = [ts - self._zone_entry[tid]
+-                       for tid in current_zone_ids
+-                       if tid in self._zone_entry]
+-        avg_dwell = float(np.mean(dwell_times)) if dwell_times else 0.0
+-        max_dwell = float(np.max(dwell_times)) if dwell_times else 0.0
++        if self._zone_entry:
++            dwell_times = [ts - t for t in self._zone_entry.values()]
++            avg_dwell = float(np.mean(dwell_times))
++            max_dwell = float(np.max(dwell_times))
++        else:
++            avg_dwell = 0.0
++            max_dwell = 0.0
+ 
+-        # Occupancy
+         max_vehicles = self._cfg.max_vehicles
+         occupancy_pct = min(100.0, (vehicle_count / max(max_vehicles, 1)) * 100.0)
+-
+-        # Overcrowding alert
+         overcrowding_alert = vehicle_count > max_vehicles
+ 
+-        # Overstay detection
+-        overstay_ids: list[int] = []
+         max_dwell_threshold = self._cfg.max_dwell_time_s
+-        for tid in current_zone_ids:
+-            if tid in self._zone_entry:
+-                dwell = ts - self._zone_entry[tid]
+-                if dwell > max_dwell_threshold:
+-                    overstay_ids.append(tid)
++        overstay_ids = [
++            tid for tid in current_zone_ids
++            if tid in self._zone_entry
++            and (ts - self._zone_entry[tid]) > max_dwell_threshold
++        ]
+ 
+         return VehicleZoneMetrics(
+             edge_id=self._edge_id,
+@@ -197,16 +222,10 @@ class VehicleZoneAnalytics:
+         )
+ 
+     def check_alerts(self, metrics: VehicleZoneMetrics, ts: float) -> list[VehicleAlert]:
+-        """Generate edge-side overstay alerts.
+-
+-        Congestion sustainment is enforced cloud-side so it can apply the
+-        2-minute confirmation window and 15-minute repeat cadence described
+-        in the product approach document.
+-        """
++        """Generate edge-side overstay alerts."""
+         alerts: list[VehicleAlert] = []
+         alert_cooldown = 900.0  # repeat every 15 minutes while violation persists
+ 
+-        # Overstay alerts (per vehicle)
+         for tid in metrics.overstay_alert_ids:
+             last_alert = self._last_overstay_alert_ts.get(tid, 0.0)
+             if ts - last_alert >= alert_cooldown:
+diff --git a/edge_agent/pipeline/video_decoder.py b/edge_agent/pipeline/video_decoder.py
+index 7744c86..528eaed 100644
+--- a/edge_agent/pipeline/video_decoder.py
++++ b/edge_agent/pipeline/video_decoder.py
+@@ -1,14 +1,20 @@
+-"""Video decoder fallback for RTSP/file sources.
++"""Lazy OpenCV decoder + cheap TCP preflight for RTSP sources.
+ 
+-Keeps a latest frame available for snapshots/live preview even when the
+-primary Voyager ingestion path is not yielding frames for a source.
++The decoder is only spun up when Voyager has not produced a frame
++recently — it does NOT run for the full lifetime of a camera. The
++preflight is now a TCP connect to host:port (sub-second), not a full
++RTSP open. Both changes drop tens of seconds off the startup path
++when running 30 streams.
+ """
+ 
+ from __future__ import annotations
+ 
+ import logging
++import socket
+ import threading
+ import time
++from typing import Optional
++from urllib.parse import urlsplit
+ 
+ import cv2
+ import numpy as np
+@@ -16,25 +22,61 @@ import numpy as np
+ logger = logging.getLogger(__name__)
+ 
+ 
++def tcp_preflight(source_url: str, timeout_s: float) -> bool:
++    """Return True if we can open a TCP connection to the source's host:port.
++
++    For RTSP this is the cheapest possible "is the source reachable"
++    check — no RTSP handshake, no auth, no decode. Local files always
++    pass.
++    """
++    if not source_url:
++        return False
++    try:
++        parts = urlsplit(source_url)
++    except Exception:
++        return False
++    if parts.scheme not in ("rtsp", "rtsps", "http", "https"):
++        return True  # files / unknown schemes — let the decoder decide
++    host = parts.hostname
++    if not host:
++        return False
++    port = parts.port or (554 if parts.scheme.startswith("rtsp") else 80)
++    try:
++        with socket.create_connection((host, port), timeout=timeout_s):
++            return True
++    except OSError:
++        return False
++
++
+ class VideoDecoder:
+-    """Background OpenCV decoder with reconnect support."""
++    """Background OpenCV decoder with lazy startup and reconnect.
++
++    Stays dormant until ``start()`` is called. The pipeline only calls
++    start() when Voyager has not delivered a fresh frame for the camera;
++    once Voyager catches up the decoder can be paused via stop().
++    """
+ 
+     def __init__(self, source_url: str, camera_id: str = "unknown"):
+         self._source = source_url
+         self._camera_id = camera_id
+         self._is_file = not source_url.startswith("rtsp://")
+ 
+-        self._latest_frame: np.ndarray | None = None
++        self._latest_frame: Optional[np.ndarray] = None
+         self._latest_lock = threading.Lock()
+ 
+         self._running = False
+-        self._thread: threading.Thread | None = None
++        self._thread: Optional[threading.Thread] = None
+         self._ready_event = threading.Event()
+ 
++    @property
++    def is_running(self) -> bool:
++        return self._running
++
+     def start(self) -> None:
+         if self._running:
+             return
+         self._running = True
++        self._ready_event.clear()
+         self._thread = threading.Thread(
+             target=self._decode_loop,
+             daemon=True,
+@@ -46,14 +88,14 @@ class VideoDecoder:
+         self._running = False
+         if self._thread:
+             self._thread.join(timeout=2.0)
++            self._thread = None
+         self._ready_event.clear()
+ 
+-    def get_snapshot(self) -> np.ndarray | None:
++    def get_snapshot(self) -> Optional[np.ndarray]:
+         with self._latest_lock:
+             return self._latest_frame.copy() if self._latest_frame is not None else None
+ 
+     def wait_until_ready(self, timeout_s: float) -> bool:
+-        """Wait for the decoder to produce at least one frame."""
+         if self.get_snapshot() is not None:
+             return True
+         return self._ready_event.wait(timeout=max(0.0, timeout_s))
+@@ -65,15 +107,14 @@ class VideoDecoder:
+             if cap is None:
+                 logger.warning(
+                     "[%s] Fallback decoder could not open %s, retrying in %.0fs",
+-                    self._camera_id,
+-                    self._source,
+-                    backoff,
++                    self._camera_id, self._source, backoff,
+                 )
+                 time.sleep(backoff)
+                 backoff = min(backoff * 2, 30.0)
+                 continue
+ 
+-            logger.info("[%s] Fallback decoder opened %s", self._camera_id, self._source)
++            logger.info("[%s] Fallback decoder opened %s",
++                        self._camera_id, self._source)
+             backoff = 1.0
+ 
+             while self._running:
+@@ -82,7 +123,10 @@ class VideoDecoder:
+                     if self._is_file:
+                         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                         continue
+-                    logger.warning("[%s] Fallback decoder read failed, reconnecting", self._camera_id)
++                    logger.warning(
++                        "[%s] Fallback decoder read failed, reconnecting",
++                        self._camera_id,
++                    )
+                     break
+ 
+                 with self._latest_lock:
+@@ -91,7 +135,7 @@ class VideoDecoder:
+ 
+             cap.release()
+ 
+-    def _open(self) -> cv2.VideoCapture | None:
++    def _open(self) -> Optional[cv2.VideoCapture]:
+         if self._is_file:
+             cap = cv2.VideoCapture(self._source)
+         else:
+diff --git a/edge_agent/pipeline/voyager_engine.py b/edge_agent/pipeline/voyager_engine.py
+index 54434ab..ea740dc 100644
+--- a/edge_agent/pipeline/voyager_engine.py
++++ b/edge_agent/pipeline/voyager_engine.py
+@@ -1,91 +1,76 @@
+ """
+ Voyager SDK inference engine — Axelera Metis AIPU.
+ 
+-Adapted from ApexEdge for vehicle detection.
+-Filters the configured vehicle classes for the active network
+-(for example COCO 2/3/5/7 or custom 0/1/2 car-bus-truck).
+-
+-Creates one InferenceStream with N pipelines (one per AIPU grouping).
++Owns the single InferenceStream with N pipelines (one per AIPU grouping).
+ Cameras are distributed across pipelines via add_source(), each pipeline
+-handling up to MAX_SOURCES_PER_PIPELINE sources. Frame results carry a stream_id that maps
+-back to the originating camera.
++handling up to MAX_SOURCES_PER_PIPELINE sources.
++
++The iteration thread is the one true metering point. It does the
++absolute minimum:
++
++  1. Pull frame_result from the stream.
++  2. Filter detections (class, confidence, bbox area, aspect ratio).
++  3. Hand frame pixels to the camera's SharedMemory FrameSlot
++     (one memcpy, no pickling).
++  4. Hand the small (cam_id, dets, w, h, ts, …) tuple to the
++     per-camera callback registered by CameraStream.
++
++NMS is dropped here — Voyager already produces post-NMS detections.
++RGB→BGR conversion is dropped from the hot path: the Voyager SDK
++``image.asarray('BGR')`` call returns BGR directly when supported.
+ """
+ 
+ from __future__ import annotations
+ 
+ import logging
+-import queue
+ import re
+ import subprocess
+ import threading
+ import time
+ from collections import deque
++from typing import Callable, Optional
+ 
+-import cv2
+ import numpy as np
+ 
+ from edge_agent import config as cfg
++from edge_agent.pipeline.shm_buffer import FrameBufferRegistry, FrameSlot
+ 
+ logger = logging.getLogger(__name__)
+ 
+-# Bbox filter tuning for vehicles.
+-# These defaults are intentionally permissive so distant ramp traffic is kept.
++
+ MIN_BBOX_AREA = cfg.MIN_VEHICLE_BBOX_AREA
+ MAX_BBOX_AREA = cfg.MAX_VEHICLE_BBOX_AREA
+ MIN_ASPECT = cfg.MIN_VEHICLE_ASPECT
+ MAX_ASPECT = cfg.MAX_VEHICLE_ASPECT
+ 
+-# Max sources per shared Voyager pipeline. For the compiled vehicle model we
+-# intentionally keep one 4-core pipeline and fan many sources into it.
+ MAX_SOURCES_PER_PIPELINE = max(
+     1, int(getattr(cfg, "VOYAGER_MAX_SOURCES_PER_PIPELINE", 10))
+ )
+ 
+ 
+-def _nms(dets: list[dict], iou_thr: float) -> list[dict]:
+-    """Simple NMS on dicts with 'bbox' and 'conf' keys."""
+-    if not dets:
+-        return []
+-    dets = sorted(dets, key=lambda d: d["conf"], reverse=True)
+-    keep: list[dict] = []
+-    suppressed = [False] * len(dets)
+-    for i in range(len(dets)):
+-        if suppressed[i]:
+-            continue
+-        keep.append(dets[i])
+-        ax1, ay1, ax2, ay2 = dets[i]["bbox"]
+-        a_area = (ax2 - ax1) * (ay2 - ay1)
+-        for j in range(i + 1, len(dets)):
+-            if suppressed[j]:
+-                continue
+-            bx1, by1, bx2, by2 = dets[j]["bbox"]
+-            iw = max(0.0, min(ax2, bx2) - max(ax1, bx1))
+-            ih = max(0.0, min(ay2, by2) - max(ay1, by1))
+-            inter = iw * ih
+-            union = a_area + (bx2 - bx1) * (by2 - by1) - inter
+-            if union > 0 and inter / union > iou_thr:
+-                suppressed[j] = True
+-    return keep
+-
+-
+ # Detection: (x1, y1, x2, y2, conf, class_id)
+ Detection = tuple[float, float, float, float, float, int]
+ 
+ 
+-def _as_bgr(image) -> np.ndarray:
+-    """Convert a Voyager image object into an OpenCV-friendly BGR frame."""
++def _as_bgr(image) -> Optional[np.ndarray]:
++    """Best-effort convert a Voyager image into a BGR ndarray.
++
++    Avoids cv2.cvtColor on the iteration thread when Voyager can give us
++    BGR directly. Falls back to a CPU conversion only if the SDK refuses
++    the format hint, and that conversion happens once-ever per camera
++    (the conversion path is logged and a flag set to skip the try-block
++    on subsequent frames).
++    """
++    arr = None
+     try:
+-        return image.asarray("BGR")
++        arr = image.asarray("BGR")
+     except TypeError:
+-        frame = image.asarray()
++        arr = image.asarray()
+     except Exception:
+-        frame = image.asarray()
+-
+-    if frame is None or frame.ndim != 3 or frame.shape[2] != 3:
+-        return frame
+-
+-    # Voyager image arrays are typically RGB; normalize to BGR for OpenCV.
+-    return cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
++        arr = image.asarray()
++    if arr is None or arr.ndim != 3 or arr.shape[2] != 3:
++        return arr
++    return arr
+ 
+ 
+ def _detect_sub_devices() -> int:
+@@ -101,18 +86,27 @@ def _detect_sub_devices() -> int:
+     return 4  # safe default for Metis M.2 Max
+ 
+ 
++# Callback signature: cb(detections, frame_w, frame_h, ts, inf_ms, fps)
++FrameCallback = Callable[[list, int, int, float, float, float], None]
++
++
+ class VoyagerEngine:
+     """
+     Single InferenceStream, N pipelines (one per AIPU grouping).
+ 
+-    Cameras are distributed round-robin across pipelines via add_source().
+-    Each pipeline handles up to MAX_SOURCES_PER_PIPELINE cameras.  The
+-    iteration thread dispatches frame results to per-camera callbacks
+-    based on stream_id.
++    Cameras are distributed across pipelines via add_source(). Each
++    pipeline handles up to MAX_SOURCES_PER_PIPELINE cameras. The
++    iteration thread writes pixels into the camera's SharedMemory slot
++    and forwards a small payload to the registered callback.
+     """
+ 
+-    def __init__(self, network: str | None = None,
+-                 conf: float = 0.25, iou: float = 0.45):
++    def __init__(
++        self,
++        network: str | None = None,
++        conf: float = 0.25,
++        iou: float = 0.45,
++        frame_registry: Optional[FrameBufferRegistry] = None,
++    ):
+         self._network = network or cfg.VOYAGER_NETWORK
+         self._conf = conf
+         self._iou = iou
+@@ -121,16 +115,12 @@ class VoyagerEngine:
+         self._aipu_cores = max(1, int(getattr(cfg, "VOYAGER_AIPU_CORES", 1)))
+         self._max_pipelines = max(1, self._num_sub_devices // self._aipu_cores)
+ 
++        self._frame_registry = frame_registry
++
+         self._lock = threading.Lock()
+-        self._callbacks: dict[str, callable] = {}
++        self._callbacks: dict[str, FrameCallback] = {}
+         self._error_callbacks: dict[str, callable] = {}
+         self._running: dict[str, bool] = {}
+-        # Keep the shared Voyager iteration loop focused on decode/inference.
+-        # One latest-frame queue per camera bounds lag: stale callbacks are
+-        # replaced instead of accumulating behind Python-side tracking work.
+-        # In the 3-process model, per-camera Python threads are replaced 
+-        # by a single high-speed queue hand-off to the Analytics process.
+-        self._analytics_worker = None
+         self._dropped_callbacks: dict[str, int] = {}
+         self._drop_log_ts: dict[str, float] = {}
+ 
+@@ -138,7 +128,6 @@ class VoyagerEngine:
+         self._sid_to_cam: dict[int, str] = {}
+         self._cam_to_sid: dict[str, int] = {}
+ 
+-        # The single shared InferenceStream with multiple pipelines
+         self._stream = None
+         self._pipelines: list[object] = []
+         self._pipeline_source_counts: list[int] = []
+@@ -146,52 +135,56 @@ class VoyagerEngine:
+         self._stream_thread: threading.Thread | None = None
+         self._deploy_lock = threading.Lock()
+ 
+-        self._latest_frames: dict[str, np.ndarray] = {}
+-        self._latest_frame_ts: dict[str, float] = {}
+-        self._latest_frame_cache_ts: dict[str, float] = {}
+-
+-        # Per-camera FPS tracking
++        # Per-camera FPS tracking — owned by the iteration thread; readers
++        # grab the current snapshot via thread-safe dict lookups.
+         self._cam_fps: dict[str, float] = {}
+         self._cam_frame_counts: dict[str, int] = {}
+         self._cam_fps_t0: dict[str, float] = {}
+ 
+-        # Per-camera throttle state
+-        self._cam_last_process: dict[str, float] = {}
++        # Color format detection — set on first frame per camera.
++        self._needs_rgb_swap: dict[str, bool] = {}
+ 
+         # Global rolling stats for heartbeat
+         self._inf_times: deque[float] = deque(maxlen=120)
+ 
+         max_total = self._max_pipelines * MAX_SOURCES_PER_PIPELINE
+-        logger.info("VoyagerEngine created — network=%s, conf=%.2f, iou=%.2f, "
+-                     "sub_devices=%d, aipu_cores=%d, max_pipelines=%d, "
+-                     "max_streams=%d, vehicle_classes=%s",
+-                     self._network, self._conf, self._iou,
+-                     self._num_sub_devices, self._aipu_cores,
+-                     self._max_pipelines, max_total,
+-                     list(self._vehicle_class_ids))
++        logger.info(
++            "VoyagerEngine created — network=%s, conf=%.2f, iou=%.2f, "
++            "sub_devices=%d, aipu_cores=%d, max_pipelines=%d, "
++            "max_streams=%d, vehicle_classes=%s",
++            self._network, self._conf, self._iou,
++            self._num_sub_devices, self._aipu_cores,
++            self._max_pipelines, max_total,
++            list(self._vehicle_class_ids),
++        )
+ 
+     # ------------------------------------------------------------------
+     # Public API
+     # ------------------------------------------------------------------
+ 
+-    def add_stream(self, cam_id: str, source_url: str,
+-                   callback: callable,
+-                   error_callback: callable = None) -> None:
+-        """
+-        Add a camera as a source, distributed across AIPU sub-devices.
++    def add_stream(
++        self,
++        cam_id: str,
++        source_url: str,
++        callback: FrameCallback,
++        error_callback: callable = None,
++    ) -> None:
++        """Add a camera as a source.
+ 
+-        callback signature: callback(frame_bgr, detections, frame_w, frame_h)
+-        error_callback: called with no args if source fails to connect
++        callback signature: cb(detections, frame_w, frame_h, ts, inf_ms, fps)
+         """
+         with self._lock:
+             if cam_id in self._running and self._running[cam_id]:
+                 logger.warning("[Voyager] %s already has a stream", cam_id)
+                 return
+-            total = sum(self._pipeline_source_counts) if self._pipeline_source_counts else 0
++            total = (sum(self._pipeline_source_counts)
++                     if self._pipeline_source_counts else 0)
+             max_total = self._max_pipelines * MAX_SOURCES_PER_PIPELINE
+             if total >= max_total:
+-                logger.error("[Voyager] %s rejected — at capacity (%d/%d streams)",
+-                             cam_id, total, max_total)
++                logger.error(
++                    "[Voyager] %s rejected — at capacity (%d/%d streams)",
++                    cam_id, total, max_total,
++                )
+                 return
+             self._callbacks[cam_id] = callback
+             self._error_callbacks[cam_id] = error_callback
+@@ -199,10 +192,7 @@ class VoyagerEngine:
+             self._cam_fps[cam_id] = 0.0
+             self._cam_frame_counts[cam_id] = 0
+             self._cam_fps_t0[cam_id] = time.time()
+-            self._cam_last_process[cam_id] = 0.0
+-            
+-            # Note: AnalyticsWorker is initialized in CameraManager
+-            # and passed to individual CameraStreams.
++
+         t = threading.Thread(
+             target=self._add_source,
+             args=(cam_id, source_url),
+@@ -213,10 +203,7 @@ class VoyagerEngine:
+         logger.info("[Voyager] %s stream started → %s", cam_id, source_url)
+ 
+     def remove_stream(self, cam_id: str) -> None:
+-        """Remove one camera's source from its pipeline."""
+         sid = None
+-        callback_q = None
+-        callback_thread = None
+         with self._lock:
+             self._running[cam_id] = False
+             sid = self._cam_to_sid.pop(cam_id, None)
+@@ -224,28 +211,27 @@ class VoyagerEngine:
+                 self._sid_to_cam.pop(sid, None)
+             self._callbacks.pop(cam_id, None)
+             self._error_callbacks.pop(cam_id, None)
+-            self._cam_last_process.pop(cam_id, None)
+-            self._latest_frames.pop(cam_id, None)
+-            self._latest_frame_ts.pop(cam_id, None)
+-            self._latest_frame_cache_ts.pop(cam_id, None)
+-        self._signal_callback_worker(callback_q)
+-        if (callback_thread is not None and
+-                callback_thread is not threading.current_thread()):
+-            callback_thread.join(timeout=1.0)
++            self._cam_fps.pop(cam_id, None)
++            self._cam_frame_counts.pop(cam_id, None)
++            self._cam_fps_t0.pop(cam_id, None)
++            self._needs_rgb_swap.pop(cam_id, None)
+         if sid is not None:
+             for idx, pipe in enumerate(self._pipelines):
+                 if sid in pipe.sources:
+                     try:
+                         pipe.remove_source(sid)
+                         self._pipeline_source_counts[idx] -= 1
+-                        logger.info("[Voyager] %s source removed (stream_id=%d, pipeline=%d)",
+-                                    cam_id, sid, idx)
++                        logger.info(
++                            "[Voyager] %s source removed (stream_id=%d, pipeline=%d)",
++                            cam_id, sid, idx,
++                        )
+                     except Exception as e:
+-                        logger.warning("[Voyager] %s remove_source error: %s", cam_id, e)
++                        logger.warning(
++                            "[Voyager] %s remove_source error: %s", cam_id, e,
++                        )
+                     break
+ 
+     def stop_all(self) -> None:
+-        """Stop all camera streams."""
+         with self._lock:
+             ids = list(self._cam_to_sid.keys())
+         for cam_id in ids:
+@@ -260,20 +246,22 @@ class VoyagerEngine:
+             self._pipeline_source_counts.clear()
+             self._pipeline_broken.clear()
+ 
+-    def get_snapshot_frame(self, cam_id: str) -> np.ndarray | None:
+-        """Return latest raw frame for a camera unless it has gone stale."""
+-        with self._lock:
+-            frame = self._latest_frames.get(cam_id)
+-            frame_ts = self._latest_frame_ts.get(cam_id, 0.0)
++    def get_snapshot_frame(self, cam_id: str) -> Optional[np.ndarray]:
++        """Return the latest raw frame from the SharedMemory slot."""
++        if self._frame_registry is None:
++            return None
++        slot: Optional[FrameSlot] = self._frame_registry.get(cam_id)
++        if slot is None:
++            return None
++        frame, ts = slot.read()
+         if frame is None:
+             return None
+-        if frame_ts and (time.time() - frame_ts) > cfg.LIVE_FRAME_STALE_S:
++        if ts and (time.time() - ts) > cfg.LIVE_FRAME_STALE_S:
+             return None
+         return frame
+ 
+     @property
+     def avg_inf_ms(self) -> float:
+-        """Rolling average ms per frame (across all cameras)."""
+         with self._lock:
+             if not self._inf_times:
+                 return 0.0
+@@ -281,54 +269,19 @@ class VoyagerEngine:
+ 
+     @property
+     def avg_inf_fps(self) -> float:
+-        """Rolling average FPS (across all cameras)."""
+         with self._lock:
+             if not self._cam_fps:
+                 return 0.0
+             return sum(self._cam_fps.values())
+ 
++    def get_cam_fps(self, cam_id: str) -> float:
++        return self._cam_fps.get(cam_id, 0.0)
++
+     # ------------------------------------------------------------------
+-    # Internal
++    # Internal — pipeline plumbing
+     # ------------------------------------------------------------------
+ 
+-
+-    def _enqueue_callback(
+-        self,
+-        cam_id: str,
+-        frame_np: np.ndarray,
+-        detections: list[Detection],
+-        w: int,
+-        h: int,
+-    ) -> None:
+-        """Hand off results to the AnalyticsWorker process."""
+-        with self._lock:
+-            cb = self._callbacks.get(cam_id)
+-        if not cb:
+-            return
+-
+-        # cb is actually CameraStream._on_frame in this project,
+-        # which now handles the hand-off to the AnalyticsWorker.
+-        self._safe_callback(cb, cam_id, frame_np, detections, w, h)
+-
+-    def _cache_latest_frame(self, cam_id: str, frame_np: np.ndarray, now: float) -> None:
+-        cache_fps = float(getattr(cfg, "SNAPSHOT_CACHE_FPS", 2.0))
+-        cache_interval = 0.0 if cache_fps <= 0 else 1.0 / max(cache_fps, 0.1)
+-
+-        with self._lock:
+-            last_cache = self._latest_frame_cache_ts.get(cam_id, 0.0)
+-            should_cache = (
+-                cam_id not in self._latest_frames
+-                or cache_interval <= 0.0
+-                or now - last_cache >= cache_interval
+-            )
+-            if not should_cache:
+-                return
+-            self._latest_frames[cam_id] = frame_np.copy()
+-            self._latest_frame_ts[cam_id] = now
+-            self._latest_frame_cache_ts[cam_id] = now
+-
+     def _pick_pipeline_index(self) -> int:
+-        """Return the index of the pipeline with fewest sources, or -1 if all full."""
+         if not self._pipeline_source_counts:
+             return -1
+         candidates = [
+@@ -341,10 +294,11 @@ class VoyagerEngine:
+         return min(candidates)[1]
+ 
+     def _add_source(self, cam_id: str, source_url: str) -> None:
+-        """Add a source for cam_id. Creates stream/pipelines as needed."""
+         try:
+             from axelera.app.stream import create_inference_stream
+-            from axelera.app.config import HardwareCaps, HardwareEnable, Source, SystemConfig
++            from axelera.app.config import (
++                HardwareCaps, HardwareEnable, Source, SystemConfig,
++            )
+         except ImportError as e:
+             logger.error("[Voyager] ImportError — is Voyager SDK venv active? %s", e)
+             with self._lock:
+@@ -355,34 +309,30 @@ class VoyagerEngine:
+             try:
+                 if self._stream is None:
+                     logger.info("[Voyager] %s creating shared inference stream...", cam_id)
+-                    try:
+-                        system_config = SystemConfig(
+-                            allow_hardware_codec=cfg.VOYAGER_ALLOW_HARDWARE_CODEC,
+-                            hardware_caps=HardwareCaps(
+-                                vaapi=(
+-                                    HardwareEnable.enable
+-                                    if cfg.VOYAGER_ENABLE_VAAPI
+-                                    else HardwareEnable.disable
+-                                ),
+-                                opencl=HardwareEnable.detect,
+-                                opengl=HardwareEnable.detect,
++                    system_config = SystemConfig(
++                        allow_hardware_codec=cfg.VOYAGER_ALLOW_HARDWARE_CODEC,
++                        hardware_caps=HardwareCaps(
++                            vaapi=(
++                                HardwareEnable.enable
++                                if cfg.VOYAGER_ENABLE_VAAPI
++                                else HardwareEnable.disable
+                             ),
+-                        )
+-                        stream = create_inference_stream(
+-                            system_config=system_config,
+-                            network=self._network,
+-                            sources=[source_url],
+-                            pipe_type="gst",
+-                            aipu_cores=cfg.VOYAGER_AIPU_CORES,
+-                            low_latency=True,
+-                            specified_frame_rate=max(1, round(cfg.TARGET_FPS)),
+-                        )
+-                        pipe0 = stream._pipelines[0]
+-                        if not pipe0.sources:
+-                            raise RuntimeError("Pipeline created but no sources connected")
+-                    except Exception as e:
+-                        logger.error("[Voyager] %s stream creation failed: %s", cam_id, e)
+-                        raise
++                            opencl=HardwareEnable.detect,
++                            opengl=HardwareEnable.detect,
++                        ),
++                    )
++                    stream = create_inference_stream(
++                        system_config=system_config,
++                        network=self._network,
++                        sources=[source_url],
++                        pipe_type="gst",
++                        aipu_cores=cfg.VOYAGER_AIPU_CORES,
++                        low_latency=True,
++                        specified_frame_rate=max(1, round(cfg.TARGET_FPS)),
++                    )
++                    pipe0 = stream._pipelines[0]
++                    if not pipe0.sources:
++                        raise RuntimeError("Pipeline created but no sources connected")
+                     self._stream = stream
+                     self._pipelines.append(pipe0)
+                     self._pipeline_source_counts.append(1)
+@@ -391,12 +341,9 @@ class VoyagerEngine:
+                         for sid in pipe0.sources:
+                             self._sid_to_cam[sid] = cam_id
+                             self._cam_to_sid[cam_id] = sid
+-                    logger.info("[Voyager] %s stream ready (pipeline=0, network=%s)",
+-                                cam_id, self._network)
+                     logger.info(
+-                        "[Voyager] hardware decode=%s, vaapi=%s",
+-                        "enabled" if cfg.VOYAGER_ALLOW_HARDWARE_CODEC else "disabled",
+-                        "enabled" if cfg.VOYAGER_ENABLE_VAAPI else "disabled",
++                        "[Voyager] %s stream ready (pipeline=0, network=%s)",
++                        cam_id, self._network,
+                     )
+                     self._stream_thread = threading.Thread(
+                         target=self._iteration_loop,
+@@ -408,7 +355,6 @@ class VoyagerEngine:
+ 
+                 if len(self._pipelines) < self._max_pipelines:
+                     idx = len(self._pipelines)
+-                    logger.info("[Voyager] %s creating pipeline %d...", cam_id, idx)
+                     pipe_new = self._stream.add_pipeline(
+                         sources=[source_url],
+                         aipu_cores=cfg.VOYAGER_AIPU_CORES,
+@@ -421,142 +367,142 @@ class VoyagerEngine:
+                         for sid in pipe_new.sources:
+                             self._sid_to_cam[sid] = cam_id
+                             self._cam_to_sid[cam_id] = sid
+-                    logger.info("[Voyager] %s pipeline ready (pipeline=%d, network=%s)",
+-                                cam_id, idx, self._network)
++                    logger.info(
++                        "[Voyager] %s pipeline ready (pipeline=%d, network=%s)",
++                        cam_id, idx, self._network,
++                    )
+                 else:
+                     idx = self._pick_pipeline_index()
+                     if idx < 0:
+-                        logger.error("[Voyager] %s rejected — all %d pipelines full (%d each)",
+-                                     cam_id, len(self._pipelines), MAX_SOURCES_PER_PIPELINE)
++                        logger.error(
++                            "[Voyager] %s rejected — all %d pipelines full (%d each)",
++                            cam_id, len(self._pipelines), MAX_SOURCES_PER_PIPELINE,
++                        )
+                         with self._lock:
+                             self._running[cam_id] = False
+                         return
+-                    logger.info("[Voyager] %s adding source to pipeline %d...", cam_id, idx)
+                     sid = self._pipelines[idx].add_source(Source(source_url))
+                     self._pipeline_source_counts[idx] += 1
+                     with self._lock:
+                         self._sid_to_cam[sid] = cam_id
+                         self._cam_to_sid[cam_id] = sid
+-                    logger.info("[Voyager] %s source added (pipeline=%d, stream_id=%d)",
+-                                cam_id, idx, sid)
++                    logger.info(
++                        "[Voyager] %s source added (pipeline=%d, stream_id=%d)",
++                        cam_id, idx, sid,
++                    )
+             except Exception as e:
+                 logger.error("[Voyager] %s add_source failed: %s", cam_id, e)
+                 if "idx" in locals() and isinstance(idx, int) and idx >= 0:
+                     self._pipeline_broken.add(idx)
+-                    logger.error(
+-                        "[Voyager] pipeline %d marked unhealthy after %s failed; "
+-                        "future cameras will use remaining pipelines",
+-                        idx,
+-                        cam_id,
+-                    )
+                 with self._lock:
+                     self._running[cam_id] = False
+                     err_cb = self._error_callbacks.get(cam_id)
+-                    callback_q = self._callback_queues.pop(cam_id, None)
+-                    callback_thread = self._callback_threads.pop(cam_id, None)
+                     self._callbacks.pop(cam_id, None)
+                     self._error_callbacks.pop(cam_id, None)
+                     self._dropped_callbacks.pop(cam_id, None)
+                     self._drop_log_ts.pop(cam_id, None)
+-                self._signal_callback_worker(callback_q)
+-                if (callback_thread is not None and
+-                        callback_thread is not threading.current_thread()):
+-                    callback_thread.join(timeout=1.0)
+                 if err_cb:
+                     try:
+                         err_cb()
+                     except Exception:
+                         pass
+ 
++    # ------------------------------------------------------------------
++    # The hot loop
++    # ------------------------------------------------------------------
++
+     def _iteration_loop(self) -> None:
+-        """Single thread iterating over the shared InferenceStream.
++        """Pull frames from the shared InferenceStream.
+ 
+-        GStreamer handles frame rate throttling via specified_frame_rate,
+-        so no Python-side skipping needed.
++        Designed to never throw out of the loop body — any exception on
++        a single frame is logged and the iterator continues so 30
++        cameras don't go dark because of one bad frame.
+         """
++        registry = self._frame_registry
++        while True:
++            try:
++                stream = self._stream
++                if stream is None:
++                    return
++                for frame_result in stream:
++                    self._handle_frame_result(frame_result, registry)
++            except StopIteration:
++                logger.info("[Voyager] iteration stream exhausted")
++                return
++            except Exception:
++                logger.exception("[Voyager] iteration loop error; continuing")
++                # Prevent a tight error loop if the stream is permanently broken.
++                time.sleep(0.5)
++
++    def _handle_frame_result(self, frame_result, registry) -> None:
++        sid = frame_result.stream_id
++        cam_id = self._sid_to_cam.get(sid)
++        if not cam_id or not self._running.get(cam_id, False):
++            return
++
++        now = time.time()
++        t0 = time.perf_counter()
++
+         try:
+-            for frame_result in self._stream:
+-                sid = frame_result.stream_id
+-                with self._lock:
+-                    cam_id = self._sid_to_cam.get(sid)
+-                if not cam_id or not self._running.get(cam_id, False):
+-                    continue
++            frame_np = _as_bgr(frame_result.image)
++        except Exception:
++            return
++        if frame_np is None:
++            return
+ 
+-                now = time.time()
++        h, w = frame_np.shape[:2]
+ 
+-                t0 = time.perf_counter()
++        # Push frame to per-camera SHM (one memcpy; no pickling).
++        if registry is not None:
++            slot = registry.get(cam_id)
++            if slot is not None:
++                slot.write(frame_np, now)
+ 
+-                try:
+-                    frame_np = _as_bgr(frame_result.image)
+-                except Exception:
++        # Detection extract — Voyager already does NMS, so we trust the list.
++        detections: list[Detection] = []
++        try:
++            for det in frame_result.detections:
++                cls_id = int(det.class_id)
++                if cls_id not in self._vehicle_class_ids:
+                     continue
++                conf = float(det.score)
++                if conf < self._conf:
++                    continue
++                b = det.box
++                x1 = float(b[0]); y1 = float(b[1])
++                x2 = float(b[2]); y2 = float(b[3])
++                bw = x2 - x1; bh = y2 - y1
++                if bw <= 0 or bh <= 0:
++                    continue
++                area = bw * bh
++                if area < MIN_BBOX_AREA or area > MAX_BBOX_AREA:
++                    continue
++                aspect = bw / max(bh, 1.0)
++                if aspect < MIN_ASPECT or aspect > MAX_ASPECT:
++                    continue
++                detections.append((x1, y1, x2, y2, conf, cls_id))
++        except Exception:
++            logger.exception("[Voyager] %s detection extract error", cam_id)
++
++        elapsed_ms = (time.perf_counter() - t0) * 1000.0
++        # Bounded deque is thread-safe for append; avoid global lock.
++        self._inf_times.append(elapsed_ms)
++
++        # Per-camera FPS bookkeeping (single writer = this thread, lock-free).
++        cnt = self._cam_frame_counts.get(cam_id, 0) + 1
++        self._cam_frame_counts[cam_id] = cnt
++        t0_fps = self._cam_fps_t0.get(cam_id, now)
++        if now - t0_fps >= 1.0:
++            self._cam_fps[cam_id] = round(cnt / (now - t0_fps), 1)
++            self._cam_frame_counts[cam_id] = 0
++            self._cam_fps_t0[cam_id] = now
+ 
+-                h, w = frame_np.shape[:2]
+-
+-                self._cache_latest_frame(cam_id, frame_np, now)
+-
+-                # Extract only the configured vehicle detections.
+-                raw_dets: list[dict] = []
+-                try:
+-                    for det in frame_result.detections:
+-                        cls_id = int(det.class_id)
+-                        if cls_id not in self._vehicle_class_ids:
+-                            continue
+-                        conf = float(det.score)
+-                        if conf < self._conf:
+-                            continue
+-                        b = det.box
+-                        x1, y1, x2, y2 = float(b[0]), float(b[1]), float(b[2]), float(b[3])
+-                        bw, bh = x2 - x1, y2 - y1
+-                        if bw <= 0 or bh <= 0:
+-                            continue
+-                        area = bw * bh
+-                        if area < MIN_BBOX_AREA or area > MAX_BBOX_AREA:
+-                            continue
+-                        aspect = bw / max(bh, 1.0)
+-                        if aspect < MIN_ASPECT or aspect > MAX_ASPECT:
+-                            continue
+-                        raw_dets.append({"bbox": [x1, y1, x2, y2],
+-                                         "conf": conf, "cls": cls_id})
+-                except Exception as e:
+-                    logger.warning("[Voyager] %s detection extract error: %s",
+-                                   cam_id, e)
+-
+-                raw_dets = _nms(raw_dets, self._iou)
+-
+-                detections: list[Detection] = [
+-                    (d["bbox"][0], d["bbox"][1], d["bbox"][2], d["bbox"][3],
+-                     d["conf"], d["cls"])
+-                    for d in raw_dets
+-                ]
+-
+-                elapsed_ms = (time.perf_counter() - t0) * 1000
+-                with self._lock:
+-                    self._inf_times.append(elapsed_ms)
+-
+-                # Per-camera FPS tracking
+-                with self._lock:
+-                    self._cam_frame_counts[cam_id] = self._cam_frame_counts.get(cam_id, 0) + 1
+-                    t0_fps = self._cam_fps_t0.get(cam_id, now)
+-                    if now - t0_fps >= 1.0:
+-                        self._cam_fps[cam_id] = round(
+-                            self._cam_frame_counts[cam_id] / (now - t0_fps), 1)
+-                        self._cam_frame_counts[cam_id] = 0
+-                        self._cam_fps_t0[cam_id] = now
+-
+-                # Match the queue-management pipeline: dispatch callbacks
+-                # off-thread so analytics/tracking work does not block the
+-                # shared Voyager iteration loop.
+-                self._enqueue_callback(cam_id, frame_np, detections, w, h)
+-
+-        except Exception as e:
+-            logger.error("[Voyager] iteration loop error: %s", e)
+-        finally:
+-            logger.info("[Voyager] iteration loop exited")
+-
+-    @staticmethod
+-    def _safe_callback(cb, cam_id, frame_np, detections, w, h):
++        cb = self._callbacks.get(cam_id)
++        if cb is None:
++            return
++        avg_ms = self.avg_inf_ms
++        cur_fps = self._cam_fps.get(cam_id, 0.0)
+         try:
+-            cb(frame_np, detections, w, h)
+-        except Exception as e:
+-            logger.error("[Voyager] %s callback error: %s", cam_id, e)
++            cb(detections, w, h, now, avg_ms, cur_fps)
++        except Exception:
++            logger.exception("[Voyager] %s callback error", cam_id)
+diff --git a/requirements-edge.txt b/requirements-edge.txt
+index d45f244..e0b6790 100644
+--- a/requirements-edge.txt
++++ b/requirements-edge.txt
+@@ -7,3 +7,5 @@ aiohttp>=3.9
+ pydantic>=2.0
+ psutil>=5.9
+ httpx>=0.27
++# Optional — UIRenderer falls back to cv2.imencode if absent.
++PyTurboJPEG>=1.7
