@@ -2350,7 +2350,11 @@ function setWsBadge(connected){
 }
 
 function connectWS(){
-  ws = new WebSocket(`ws://${location.host}/ws/dashboard`);
+  // Match the page scheme: wss:// when served over HTTPS (via Nginx),
+  // ws:// when hitting the app directly over HTTP on the console. A
+  // hardcoded ws:// would be blocked as mixed content on the HTTPS page.
+  const wsScheme = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${wsScheme}://${location.host}/ws/dashboard`);
   ws.onopen = () => {
     setWsBadge(true);
     recordFeedMessage({type:'connected', endpoint:'/ws/dashboard'}, 'connected', 'socket');

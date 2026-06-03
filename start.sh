@@ -9,6 +9,17 @@ SDK_ROOT="${SDK_ROOT:-/home/admin1/voyager-sdk}"
 LOG_DIR="$ROOT/.logs"
 mkdir -p "$LOG_DIR"
 
+# Load deployment secrets (DB password, CORS origin, etc.) from deploy/.env if
+# present, exporting them so both this script and the uvicorn child inherit
+# them. deploy/.env is gitignored and must never be committed; see
+# deploy/.env.example for the template.
+if [[ -f "$ROOT/deploy/.env" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$ROOT/deploy/.env"
+    set +a
+fi
+
 # Capture all stdout/stderr to disk while keeping it on the terminal. Without
 # this the supervisor's restart/watchdog/give-up messages only existed on the
 # controlling tty — the 1h 36m silent outage on 2026-05-19 was undiagnosable
@@ -27,13 +38,31 @@ error() { echo -e "${RED}[ERROR]${NC} $*"; }
 
 LOCAL_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 DASHBOARD_URL="http://localhost:8002/dashboard"
+# LAN clients no longer reach :8002 directly (it's bound to loopback).
+# They go through the Nginx reverse proxy on HTTPS/443.
 if [[ -n "${LOCAL_IP:-}" ]]; then
-    DASHBOARD_LAN_URL="http://$LOCAL_IP:8002/dashboard"
+    DASHBOARD_LAN_URL="https://$LOCAL_IP/dashboard  (via Nginx — requires deploy/nginx setup)"
 else
     DASHBOARD_LAN_URL=""
 fi
 
 SUPERVISOR_SHUTDOWN=0
+
+# Path to the root-owned Metis reset helper installed via the narrow sudoers
+# rule (deploy/axelera-metis-nopasswd.in). Overridable for non-standard installs.
+METIS_RESET_BIN="${METIS_RESET_BIN:-/usr/local/sbin/metis-reset.sh}"
+
+metis_reset() {
+    # Reset the Metis NPU through the root-owned helper (one narrow sudoers
+    # rule), scoped strictly to the metis-bound PCI device. Falls back to
+    # `axdevice --refresh` on a dev box where the helper isn't installed.
+    # </dev/null ensures a sudo password prompt can never hang the restart loop.
+    if [[ -x "$METIS_RESET_BIN" ]]; then
+        timeout 60 sudo -n "$METIS_RESET_BIN" </dev/null 2>/dev/null || true
+    else
+        timeout 60 axdevice --refresh </dev/null 2>/dev/null || true
+    fi
+}
 
 cleanup() {
     SUPERVISOR_SHUTDOWN=1
@@ -49,8 +78,8 @@ cleanup() {
     fuser -k -9 /dev/metis* 2>/dev/null || true
     sleep 1
 
-    info "Forcing hardware firmware refresh and memory flush..."
-    timeout 60 axdevice --refresh </dev/null || true
+    info "Resetting Metis NPU (root-owned helper)..."
+    metis_reset
 
     info "Done."
 }
@@ -74,19 +103,29 @@ done
 # ------------------------------------------------------------------
 # 2. Initialize database (if needed)
 # ------------------------------------------------------------------
-DB_NAME="vehicle_zone"
-DB_USER="${VZI_DB_USER:-apexedge}"
-DB_PASS="${VZI_DB_PASS:-apexedge}"
+DB_NAME="${VZI_DB_NAME:-vehicle_zone}"
+DB_USER="${VZI_DB_USER:-vzi_app}"
 DB_HOST="${VZI_DB_HOST:-localhost}"
-export PGPASSWORD="$DB_PASS"
+DB_PORT="${VZI_DB_PORT:-5432}"
 
-if psql -U "$DB_USER" -h "$DB_HOST" -lqt 2>/dev/null | grep -qw "$DB_NAME"; then
+# No default password: production must not retain default DB credentials
+# (security observation #5). The password comes from the environment, normally
+# via deploy/.env which is sourced at the top of this script.
+if [[ -z "${VZI_DB_PASSWORD:-}" ]]; then
+    error "VZI_DB_PASSWORD is not set."
+    error "  Copy deploy/.env.example to deploy/.env and set a strong DB password."
+    error "  Default credentials are not permitted."
+    exit 1
+fi
+export PGPASSWORD="$VZI_DB_PASSWORD"
+
+if psql -U "$DB_USER" -h "$DB_HOST" -p "$DB_PORT" -lqt 2>/dev/null | grep -qw "$DB_NAME"; then
     info "Database '$DB_NAME' already exists"
 else
     info "Creating database '$DB_NAME'..."
-    createdb -U "$DB_USER" -h "$DB_HOST" "$DB_NAME" 2>/dev/null || true
-    psql -U "$DB_USER" -h "$DB_HOST" -d "$DB_NAME" -c "CREATE EXTENSION IF NOT EXISTS timescaledb;" 2>/dev/null || true
-    psql -U "$DB_USER" -h "$DB_HOST" -d "$DB_NAME" -f "$ROOT/schema.sql"
+    createdb -U "$DB_USER" -h "$DB_HOST" -p "$DB_PORT" "$DB_NAME" 2>/dev/null || true
+    psql -U "$DB_USER" -h "$DB_HOST" -p "$DB_PORT" -d "$DB_NAME" -c "CREATE EXTENSION IF NOT EXISTS timescaledb;" 2>/dev/null || true
+    psql -U "$DB_USER" -h "$DB_HOST" -p "$DB_PORT" -d "$DB_NAME" -f "$ROOT/schema.sql"
     info "Database initialized"
 fi
 
@@ -99,10 +138,14 @@ unset PGPASSWORD
 lsof -ti:8002 | xargs kill -9 2>/dev/null || true
 sleep 0.5
 
-info "Starting cloud server on :8002..."
+info "Starting cloud server on 127.0.0.1:8002..."
 cd "$ROOT"
+# Bind to loopback only. The dashboard must be reached through the Nginx
+# reverse proxy on HTTPS/443 (see deploy/nginx/vehicle-dashboard.conf), not
+# directly on 8002 from the LAN. The server console can still use
+# http://localhost:8002 locally.
 PYTHONPATH="$ROOT:$SDK_ROOT" python3 -m uvicorn cloud.main:app \
-    --host 0.0.0.0 --port 8002 --log-level info \
+    --host 127.0.0.1 --port 8002 --log-level info \
     > "$LOG_DIR/cloud.log" 2>&1 &
 CLOUD_PID=$!
 sleep 2
@@ -232,7 +275,7 @@ supervise_edge() {
         pkill -9 -f "edge_agent.main" 2>/dev/null || true
         fuser -k -9 /dev/metis* 2>/dev/null || true
         sleep 1
-        timeout 60 axdevice --refresh </dev/null 2>/dev/null || true
+        metis_reset
 
         # Backoff: if the edge crashed fast, slow down and bail after N in a row.
         if [[ $ran_for -lt $MIN_HEALTHY_RUN_S ]]; then

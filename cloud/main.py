@@ -1,7 +1,8 @@
 """
 Vehicle Zone Intelligence — Cloud API server.
 
-Run with: PYTHONPATH=. uvicorn cloud.main:app --host 0.0.0.0 --port 8002
+Run with: PYTHONPATH=. uvicorn cloud.main:app --host 127.0.0.1 --port 8002
+(LAN access is via the Nginx reverse proxy on HTTPS/443, not directly on 8002.)
 
 Startup:
   1. Connect PostgreSQL (asyncpg)
@@ -15,15 +16,17 @@ Startup:
 from __future__ import annotations
 
 import logging
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
+from cloud.config import settings
 from cloud.models.db import init_db, close_db, init_redis, close_redis
 from cloud.modules.ingestion.mqtt_consumer import MQTTConsumer
 from cloud.modules.alerts.alert_engine import AlertEngine
@@ -156,11 +159,13 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# CORS restricted to the approved dashboard origin(s) only — no wildcard
+# (security observation #6). Configure via VZI_CORS_ALLOW_ORIGINS.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.cors_origins,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 app.add_middleware(AdminOnlyMiddleware)
@@ -190,6 +195,9 @@ async def whoami(request: Request):
 
 
 _STATIC_DIR = Path(__file__).parent / "static"
+_ALERT_IMG_DIR = (_STATIC_DIR / "alert_images").resolve()
+# Alert evidence filenames are "{alert_id}.jpg" (see modules/alerts/image_capture).
+_ALERT_IMG_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+\.jpg$")
 
 
 @app.get("/")
@@ -202,13 +210,48 @@ async def dashboard():
     return FileResponse(_STATIC_DIR / "dashboard.html")
 
 
+@app.get("/static/alert_images/{filename}")
+async def alert_image(filename: str):
+    """Serve alert evidence images through a dedicated, validated handler
+    instead of the blanket static mount (security observation #11).
+
+    Access is gated by the Nginx perimeter — the app is bound to loopback and
+    only reachable via Nginx with its source-IP allowlist — so direct
+    unauthenticated LAN access is already blocked. This route adds
+    path-traversal protection, disables any directory access, and sets a
+    private cache policy. It is the single chokepoint where per-user
+    authorization will attach once login lands (observation #1).
+    """
+    if not _ALERT_IMG_NAME_RE.match(filename):
+        return JSONResponse(status_code=404, content={"error": "not_found"})
+    path = (_ALERT_IMG_DIR / filename).resolve()
+    # Defence in depth: ensure the resolved path stays inside the image dir.
+    if not path.is_relative_to(_ALERT_IMG_DIR) or not path.is_file():
+        return JSONResponse(status_code=404, content={"error": "not_found"})
+    return FileResponse(
+        path,
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "private, max-age=86400",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+# Mount the rest of /static AFTER the alert-image route above, so that route
+# takes precedence for /static/alert_images/* (StaticFiles never serves alert
+# evidence directly). StaticFiles does not list directories (html=False), so
+# directory listing is disabled (observation #11).
 app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 
 
 if __name__ == "__main__":
+    # Bind to loopback only — the dashboard is exposed to the LAN through the
+    # Nginx reverse proxy on HTTPS/443 (deploy/nginx/vehicle-dashboard.conf),
+    # never directly on 8002.
     uvicorn.run(
         "cloud.main:app",
-        host="0.0.0.0",
+        host="127.0.0.1",
         port=8002,
         reload=False,
         log_level="info",

@@ -191,20 +191,13 @@ async def main():
     # for slot allocation. The streams will simply queue their first
     # CONFIG/DATA messages; analytics shards drain them as soon as they
     # boot.
-    # Throttle startup source additions. Firing many add_camera calls at
-    # once (was Semaphore(10)) hammered the Voyager SDK with concurrent
-    # add_source operations and left a random ~5 of 23 cameras
-    # attached-but-dark on every restart. Serialize (concurrency=1) and
-    # space them out so each source fully attaches before the next begins.
-    startup_semaphore = asyncio.Semaphore(max(1, cfg.STARTUP_ADD_CONCURRENCY))
+    startup_semaphore = asyncio.Semaphore(10)
 
     async def _safe_start(cam):
         async with startup_semaphore:
             await asyncio.to_thread(
                 camera_manager.add_camera, cam.camera_id, cam.source_url, cam.zones,
             )
-            if cfg.SOURCE_ADD_THROTTLE_S > 0:
-                await asyncio.sleep(cfg.SOURCE_ADD_THROTTLE_S)
 
     await asyncio.gather(*(_safe_start(cam) for cam in cameras))
 

@@ -188,9 +188,19 @@ for ingest errors.
 
 ### Environment Variables (Cloud)
 
+Database credentials and other secrets are loaded from `deploy/.env` (see
+`deploy/.env.example`). There is **no default DB password** — `VZI_DB_PASSWORD`
+must be set or the server refuses to start.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `VZI_DATABASE_URL_RAW` | `postgresql://...` | TimescaleDB URL |
+| `VZI_DB_USER` | `vzi_app` | Application DB user (least privilege) |
+| `VZI_DB_PASSWORD` | _(required)_ | DB password — no default; must be set |
+| `VZI_DB_HOST` | `localhost` | DB host |
+| `VZI_DB_PORT` | `5432` | DB port |
+| `VZI_DB_NAME` | `vehicle_zone` | DB name |
+| `VZI_CORS_ALLOW_ORIGINS` | `http://localhost:8002,...` | Approved dashboard origin(s); no wildcard |
+| `VZI_TRUSTED_PROXY_IPS` | `127.0.0.1,::1` | Peers whose forwarded client-IP is trusted (Nginx) |
 | `VZI_REDIS_URL` | `redis://localhost:6379/1` | Redis URL (DB 1) |
 | `VZI_MQTT_HOST` | `localhost` | MQTT broker host |
 | `VZI_PROBE_CAMERA_SNAPSHOTS` | `false` | Enable expensive snapshot probes in `/api/cameras` |

@@ -118,17 +118,6 @@ RTSP_CODEC_PREFLIGHT_TIMEOUT_S = float(
 SOURCE_RETRY_MAX_INTERVAL_S = float(
     os.environ.get("SOURCE_RETRY_MAX_INTERVAL_S", "30.0")
 )
-# Startup source-add throttle. Adding many Voyager sources concurrently
-# overwhelms the SDK and leaves a random subset of cameras attached-but-dark
-# (they ping fine but never deliver inference frames). Serialize the startup
-# adds (one at a time) and pause this long between each so the SDK settles
-# each source before the next begins.
-SOURCE_ADD_THROTTLE_S = float(
-    os.environ.get("SOURCE_ADD_THROTTLE_S", "1.5")
-)
-STARTUP_ADD_CONCURRENCY = int(
-    os.environ.get("STARTUP_ADD_CONCURRENCY", "1")
-)
 KEEP_FALLBACK_DECODER_OPEN = os.environ.get("KEEP_FALLBACK_DECODER_OPEN", "0") != "0"
 HTTP_ACCESS_LOG = os.environ.get("HTTP_ACCESS_LOG", "0") != "0"
 

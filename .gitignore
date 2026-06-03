@@ -9,6 +9,14 @@ __pycache__/
 # Environments and local config
 .env
 .env.*
+# ...but keep the committed template (contains no secrets)
+!deploy/.env.example
+
+# TLS material — never commit certs or private keys
+etc/ssl/
+*.key
+*.pem
+*.crt
 venv/
 .venv/
 env/
