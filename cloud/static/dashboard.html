@@ -2555,18 +2555,20 @@ function buildLogicalZones(){
 const ZONE_MAP_POSITIONS = {
   // Top row — outer ramp
   'OUTER-6': { left: 10, top: 22 },
-  'OUTER-5': { left: 31, top: 22 },
-  'OUTER-4': { left: 51, top: 22 },
-  'OUTER-3': { left: 70, top: 22 },
-  'OUTER-2': { left: 85, top: 22 },
+  'OUTER-5': { left: 27, top: 22 },
+  'OUTER-4': { left: 47, top: 22 },
+  'OUTER-3': { left: 66, top: 22 },
+  'OUTER-2': { left: 81, top: 22 },
   'OUTER-1': { left: 97, top: 22 },
-  // Bottom row — inner ramp
-  'INNER-6': { left: 12, top: 66 },
-  'INNER-5': { left: 27, top: 66 },
-  'INNER-4': { left: 47, top: 66 },
-  'INNER-3': { left: 64, top: 66 },
-  'INNER-2': { left: 79, top: 66 },
-  'INNER-1': { left: 93, top: 66 },
+  // Bottom row — inner ramp. Sit the chips BELOW the baked INNER-* labels
+  // (which sit ~66%) so the floor-plan labels/lanes stay visible, mirroring
+  // how the outer chips sit above their labels.
+  'INNER-6': { left: 12, top: 78 },
+  'INNER-5': { left: 27, top: 78 },
+  'INNER-4': { left: 47, top: 78 },
+  'INNER-3': { left: 64, top: 78 },
+  'INNER-2': { left: 79, top: 78 },
+  'INNER-1': { left: 93, top: 78 },
 };
 
 function renderThresholdSummary(){
@@ -3501,9 +3503,26 @@ function setLiveInspector(cameraId){
 }
 
 function fetchLive(){
-  fetch(API + '/api/cameras').then(r => r.json()).then(cams => {
+  // Fetch cameras and zones together so the dropdown can show which zones
+  // each camera covers, e.g. "arrival_cam_15 (OUTER-5, OUTER-6)". Zones fetch
+  // is best-effort — if it fails we still render plain camera labels.
+  Promise.all([
+    fetch(API + '/api/cameras').then(r => r.json()),
+    fetch(API + '/api/zones').then(r => r.json()).catch(() => []),
+  ]).then(([cams, zones]) => {
     const el = $('live-feeds');
     const select = $('live-camera-select');
+    // Build camera_id -> [zone display labels]. Use the zone's name (the
+    // OUTER-*/INNER-* label operators recognise), de-duped and natural-sorted.
+    const zonesByCam = {};
+    (zones || []).forEach(z => {
+      if(!z.camera_id) return;
+      const label = z.name || z.zone_id;
+      const list = (zonesByCam[z.camera_id] = zonesByCam[z.camera_id] || []);
+      if(!list.includes(label)) list.push(label);
+    });
+    Object.values(zonesByCam).forEach(list => list.sort((a, b) =>
+      String(a).localeCompare(String(b), undefined, {numeric: true, sensitivity: 'base'})));
     // Sort by displayed label using natural order, so arrival_cam_2 sits
     // before arrival_cam_10 instead of after (lexicographic would put
     // cam_10/11/12/.../18 above cam_2/3/.../9).
@@ -3521,7 +3540,12 @@ function fetchLive(){
       selectedLiveCamera = null;
       return;
     }
-    select.innerHTML = cams.map(cam => `<option value="${escapeHtml(cam.camera_id)}">${escapeHtml(cam.name || cam.camera_id)}</option>`).join('');
+    select.innerHTML = cams.map(cam => {
+      const base = cam.name || cam.camera_id;
+      const zs = zonesByCam[cam.camera_id];
+      const label = (zs && zs.length) ? `${base} (${zs.join(', ')})` : base;
+      return `<option value="${escapeHtml(cam.camera_id)}">${escapeHtml(label)}</option>`;
+    }).join('');
     const activeCamera = cams.find(cam => cam.camera_id === selectedLiveCamera) || cams[0];
     setLiveInspector(activeCamera.camera_id);
   }).catch(() => {
