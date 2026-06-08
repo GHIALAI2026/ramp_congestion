@@ -207,7 +207,16 @@ async def root():
 
 @app.get("/dashboard")
 async def dashboard():
-    return FileResponse(_STATIC_DIR / "dashboard.html")
+    # no-cache: the browser must revalidate the dashboard HTML on every load.
+    # FileResponse still sends an ETag, so an unchanged page returns a cheap
+    # 304 — but after a deploy (new JS, relabelled zones, etc.) operators
+    # immediately get the fresh page instead of a heuristically-cached old
+    # copy. Static assets that change (e.g. the ramp map image) are versioned
+    # via a ?v= query string in dashboard.html.
+    return FileResponse(
+        _STATIC_DIR / "dashboard.html",
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
 @app.get("/static/alert_images/{filename}")

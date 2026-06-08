@@ -343,7 +343,7 @@ a{color:inherit}
    plotted in % coordinates land in the right spot across all viewports. */
 .zone-map{
   position:relative;width:100%;aspect-ratio:1561/429;
-  background-image:url(/static/zone_map.png);
+  background-image:url(/static/zone_map.png?v=20260608);
   background-size:contain;background-repeat:no-repeat;background-position:top left;
   background-color:#f1f5f9;border:1px solid var(--line);border-radius:12px
 }
@@ -1170,7 +1170,7 @@ body.viewer-mode #nav-feed{display:none !important}
               <tr>
                 <th>Zone ID</th>
                 <th>Name</th>
-                <th title="Which slot on the Overview ramp map this zone feeds into. Floor plan only renders zones whose name (or group name) is one of Zone 1..Zone 12 (case-sensitive).">Map slot</th>
+                <th title="Which slot on the Overview ramp map this zone feeds into. Floor plan only renders zones whose name (or group name) is one of OUTER-1..OUTER-6 or INNER-1..INNER-6 (case-sensitive).">Map slot</th>
                 <th>Ramp Side</th>
                 <th>Camera</th>
                 <th>Max Vehicles</th>
@@ -1250,17 +1250,17 @@ body.viewer-mode #nav-feed{display:none !important}
             <button type="button" class="btn" id="f-zone-group-edit-btn" onclick="openGroupEditor('edit')" title="Edit the selected group" disabled>Edit</button>
             <button type="button" class="btn" id="f-zone-group-new-btn" onclick="openGroupEditor('create')" title="Create a new group">+ New</button>
           </div>
-          <div class="zone-help" style="margin-top:6px">A group aggregates this camera's count with other cameras that cover the same physical zone (e.g. "Zone 5" seen from 4 angles).</div>
+          <div class="zone-help" style="margin-top:6px">A group aggregates this camera's count with other cameras that cover the same physical zone (e.g. "OUTER-5" seen from 4 angles).</div>
 
           <div id="zone-group-creator" hidden style="margin-top:10px;padding:12px 14px;border:1px solid var(--line);border-radius:10px;background:#f8fafc">
             <div id="f-group-editor-title" style="font-weight:700;font-size:13px;color:#0f172a;margin-bottom:8px">New group</div>
             <div class="form-group" style="margin-bottom:8px">
               <label>Name</label>
-              <input id="f-new-group-name" placeholder="Zone 5" oninput="onNewGroupNameInput()">
+              <input id="f-new-group-name" placeholder="OUTER-5" oninput="onNewGroupNameInput()">
             </div>
             <div class="form-group" style="margin-bottom:8px">
               <label>Group ID</label>
-              <input id="f-new-group-id" placeholder="zg-zone-5">
+              <input id="f-new-group-id" placeholder="zg-outer-5">
             </div>
             <div class="form-group" style="margin-bottom:0">
               <label>Max vehicles for the whole group <span style="font-weight:400;color:var(--muted)">(optional)</span></label>
@@ -2509,7 +2509,7 @@ function buildLogicalZones(){
         // Group's max_vehicles is the threshold the operator set on the
         // group itself — independent of any single member camera's
         // max_vehicles, which was an unrelated per-feed setting.
-        max_vehicles: Number(z.group_max_vehicles || 0),
+        max_vehicles: (z.group_max_vehicles == null ? null : Number(z.group_max_vehicles)),
         overstay_count: 0,
         max_dwell_time_s: 0,
         _avg_weighted: 0,
@@ -2546,26 +2546,27 @@ function buildLogicalZones(){
 // (zone_groups.name for grouped zones; zones.name for standalones) since
 // the user confirmed those match the on-image "ZONE-N" labels.
 //
-// Image layout: top row labels go 6→5→4→3→2→1 left-to-right;
-// bottom row labels go 7→8→9→10→11→12 left-to-right. Every entry
-// here renders an overlay — entries without a matching DB zone show
-// up as a gray placeholder so the operator sees the full floor plan,
+// Image layout: the top row is the OUTER ramp, labelled OUTER-6→OUTER-1
+// left-to-right; the bottom row is the INNER ramp, labelled INNER-6→INNER-1
+// left-to-right (these match the relabelled on-image OUTER-/INNER- text).
+// Every entry here renders an overlay — entries without a matching DB zone
+// show up as a gray placeholder so the operator sees the full floor plan,
 // not gaps where unmonitored zones sit.
 const ZONE_MAP_POSITIONS = {
-  // Top row
-  'Zone 6':  { left: 10, top: 22 },
-  'Zone 5':  { left: 31, top: 22 },
-  'Zone 4':  { left: 51, top: 22 },
-  'Zone 3':  { left: 70, top: 22 },
-  'Zone 2':  { left: 85, top: 22 },
-  'Zone 1':  { left: 97, top: 22 },
-  // Bottom row
-  'Zone 7':  { left: 12, top: 66 },
-  'Zone 8':  { left: 27, top: 66 },
-  'Zone 9':  { left: 47, top: 66 },
-  'Zone 10': { left: 64, top: 66 },
-  'Zone 11': { left: 79, top: 66 },
-  'Zone 12': { left: 93, top: 66 },
+  // Top row — outer ramp
+  'OUTER-6': { left: 10, top: 22 },
+  'OUTER-5': { left: 31, top: 22 },
+  'OUTER-4': { left: 51, top: 22 },
+  'OUTER-3': { left: 70, top: 22 },
+  'OUTER-2': { left: 85, top: 22 },
+  'OUTER-1': { left: 97, top: 22 },
+  // Bottom row — inner ramp
+  'INNER-6': { left: 12, top: 66 },
+  'INNER-5': { left: 27, top: 66 },
+  'INNER-4': { left: 47, top: 66 },
+  'INNER-3': { left: 64, top: 66 },
+  'INNER-2': { left: 79, top: 66 },
+  'INNER-1': { left: 93, top: 66 },
 };
 
 function renderThresholdSummary(){
@@ -2602,16 +2603,21 @@ function renderThresholdSummary(){
       continue;
     }
     const count = parseInt(zone.vehicle_count || 0, 10);
-    const max = parseInt(zone.max_vehicles || 0, 10);
+    // Distinguish a real threshold of 0 from "no threshold set". A bare
+    // `max || '—'` renders 0 as '—' because 0 is falsy in JS — so show the
+    // number (including 0) whenever a cap exists, and '—' only when it's null.
+    const rawMax = zone.max_vehicles;
+    const max = (rawMax === null || rawMax === undefined || rawMax === '') ? null : parseInt(rawMax, 10);
+    const maxLabel = (max === null || Number.isNaN(max)) ? '—' : max;
     const pct = Math.min(999, zoneOccupancyPct(zone));
     const matchedBand = OCCUPANCY_BANDS.find(b => b.test(zone));
     const tone = matchedBand ? matchedBand.tone : occupancyTone(pct);
     const barWidth = Math.max(0, Math.min(pct, 100));
     overlays.push(`
       <div class="zone-overlay ${tone}" style="left:${pos.left}%;top:${pos.top}%"
-           title="${escapeHtml(key)}: ${count}/${max || '—'} (${pct.toFixed(0)}%)">
+           title="${escapeHtml(key)}: ${count}/${maxLabel} (${pct.toFixed(0)}%)">
         <div class="zo-name">${escapeHtml(key)}</div>
-        <div class="zo-count">${count}<span class="zo-max"> / ${escapeHtml(max || '—')}</span></div>
+        <div class="zo-count">${count}<span class="zo-max"> / ${escapeHtml(String(maxLabel))}</span></div>
         <div class="zo-bar"><div style="width:${barWidth}%"></div></div>
       </div>
     `);
@@ -3255,11 +3261,11 @@ function renderZoneSlotCell(zone, slotOwners){
   const slot = zoneMapSlot(zone);
   const onMap = slot && Object.prototype.hasOwnProperty.call(ZONE_MAP_POSITIONS, slot);
   if(!onMap){
-    // Slot label doesn't match any "Zone N" floor-plan position.
-    // Most common causes: case mismatch (e.g. "zone 12" vs "Zone 12"),
+    // Slot label doesn't match any OUTER-N / INNER-N floor-plan position.
+    // Most common causes: case mismatch (e.g. "outer-1" vs "OUTER-1"),
     // typo, or an orphan/duplicate zone the operator forgot about.
     const tip = slot
-      ? `Label "${slot}" doesn't match any floor-plan slot. Expected one of Zone 1..Zone 12 (case-sensitive). This zone will NOT appear on the Ramp Map.`
+      ? `Label "${slot}" doesn't match any floor-plan slot. Expected one of OUTER-1..OUTER-6 or INNER-1..INNER-6 (case-sensitive). This zone will NOT appear on the Ramp Map.`
       : 'No display name yet — this zone will NOT appear on the Ramp Map.';
     return `<td><span style="color:#999;font-style:italic" title="${escapeHtml(tip)}">— not mapped</span></td>`;
   }
