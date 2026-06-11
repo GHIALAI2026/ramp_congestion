@@ -13,22 +13,31 @@ router = APIRouter(prefix="/api", tags=["alerts"])
 
 @router.get("/alerts")
 async def list_alerts(
-    zone_id: str | None = None,
+    zone_id: list[str] | None = Query(None),
     alert_type: str | None = None,
+    level: str | None = None,
+    since_hours: float | None = Query(None, ge=0),
     unacked_only: bool = False,
     limit: int = Query(100, ge=1, le=500),
 ):
     """Return {alerts, counts}.
 
-    `counts` reflects the full DB matching the zone/type filters (it ignores
-    `unacked_only` deliberately) so the dashboard's stat cards survive page
-    reloads and aren't misled by the unacked-only list filter, which would
-    otherwise force the "acknowledged" count to read 0.
+    `counts` reflects the full DB matching the zone/type/level/time filters (it
+    ignores `unacked_only` deliberately) so the dashboard's stat cards survive
+    page reloads and aren't misled by the unacked-only list filter, which would
+    otherwise force the "acknowledged" count to read 0. The counts are computed
+    in SQL across the whole table, NOT from the (limit-capped) returned list, so
+    a zone/severity filter narrows them to a true full-DB total rather than a
+    slice of the most recent `limit` rows.
       - critical / warning: unacked at this level (operator backlog)
       - acknowledged:       acked rows whose acked_at is today (server-local
                             calendar day). Bounded — a lifetime counter
                             would just grow without operational meaning.
       - total:              size of the returned list (matches what's visible)
+
+    `zone_id` is repeatable: a dashboard zone filter is a friendly *label* that
+    may map to several zone_ids (a zone group), so the client sends every id the
+    label resolves to and we match with ANY().
     """
     db = await get_db()
     list_conditions: list[str] = []
@@ -37,7 +46,7 @@ async def list_alerts(
     i = 1
 
     if zone_id:
-        clause = f"zone_id = ${i}"
+        clause = f"zone_id = ANY(${i})"
         list_conditions.append(clause)
         count_conditions.append(clause)
         params.append(zone_id)
@@ -47,6 +56,18 @@ async def list_alerts(
         list_conditions.append(clause)
         count_conditions.append(clause)
         params.append(alert_type)
+        i += 1
+    if level:
+        clause = f"level = ${i}"
+        list_conditions.append(clause)
+        count_conditions.append(clause)
+        params.append(level)
+        i += 1
+    if since_hours:
+        clause = f"ts > NOW() - (${i}::double precision * INTERVAL '1 hour')"
+        list_conditions.append(clause)
+        count_conditions.append(clause)
+        params.append(since_hours)
         i += 1
     if unacked_only:
         list_conditions.append("acknowledged = FALSE")

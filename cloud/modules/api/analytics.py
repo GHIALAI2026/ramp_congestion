@@ -101,11 +101,15 @@ async def alert_buckets(
     # overcrowding (where track_id is NULL — all NULLs partition together
     # per zone, so the same query catches restart-induced overcrowding
     # bursts too).
+    # Same visit-dedup as before, but also grouped by zone so each bucket
+    # carries a per-zone breakdown (drives the bar hover tooltip). The
+    # per-zone counts sum to the bucket total, so the chart's bar heights
+    # are unchanged; we just additionally expose which zones contributed.
     rows = await db.fetch(
         """
         WITH visit_starts AS (
-          SELECT ts FROM (
-            SELECT ts,
+          SELECT ts, zone_id FROM (
+            SELECT ts, zone_id,
                    LAG(ts) OVER (PARTITION BY zone_id, track_id ORDER BY ts) AS prev_ts
             FROM vehicle_alerts
             WHERE alert_type = $1 AND ts >= $2 AND ts < $3
@@ -113,15 +117,32 @@ async def alert_buckets(
           ) t
           WHERE prev_ts IS NULL OR (ts - prev_ts) > INTERVAL '15 minutes'
         )
-        SELECT FLOOR(EXTRACT(EPOCH FROM (ts - $2)) / $4)::int AS bucket_idx,
+        SELECT FLOOR(EXTRACT(EPOCH FROM (vs.ts - $2)) / $4)::int AS bucket_idx,
+               vs.zone_id,
+               COALESCE(z.name, g.name, vs.zone_id) AS zone_name,
                COUNT(*) AS n
-        FROM visit_starts
-        GROUP BY 1
-        ORDER BY 1
+        FROM visit_starts vs
+        LEFT JOIN zones z ON z.zone_id = vs.zone_id
+        LEFT JOIN zone_groups g ON g.group_id = vs.zone_id
+        GROUP BY 1, 2, 3
+        ORDER BY 1, n DESC, zone_name
         """,
         alert_type, start, end, step_seconds, zone_id,
     )
-    counts_by_idx: dict[int, int] = {int(r["bucket_idx"]): int(r["n"]) for r in rows}
+    counts_by_idx: dict[int, int] = {}
+    zones_by_idx: dict[int, list[dict]] = {}
+    for r in rows:
+        idx = int(r["bucket_idx"])
+        n = int(r["n"])
+        counts_by_idx[idx] = counts_by_idx.get(idx, 0) + n
+        # Only zones with >=1 alert in this bucket are listed (the SQL never
+        # emits a zero row), so an empty bucket has an empty list and the UI
+        # shows no breakdown — matching "if no alerts from any zone, hide it".
+        zones_by_idx.setdefault(idx, []).append({
+            "zone_id": r["zone_id"],
+            "zone_name": r["zone_name"],
+            "count": n,
+        })
 
     # Build a continuous list so the chart renders zeros too.
     buckets = []
@@ -132,6 +153,7 @@ async def alert_buckets(
             "ts": ts_b.isoformat(),
             "label": ts_b.strftime(label_fmt),
             "count": counts_by_idx.get(i, 0),
+            "zones": zones_by_idx.get(i, []),
         })
 
     total = sum(b["count"] for b in buckets)
@@ -167,11 +189,12 @@ async def alert_buckets(
               WHERE prev_ts IS NULL OR (ts - prev_ts) > INTERVAL '15 minutes'
             )
             SELECT vs.zone_id,
-                   COALESCE(z.name, vs.zone_id) AS zone_name,
+                   COALESCE(z.name, g.name, vs.zone_id) AS zone_name,
                    COUNT(*) AS n
             FROM visit_starts vs
             LEFT JOIN zones z ON z.zone_id = vs.zone_id
-            GROUP BY vs.zone_id, z.name
+            LEFT JOIN zone_groups g ON g.group_id = vs.zone_id
+            GROUP BY vs.zone_id, z.name, g.name
             ORDER BY n DESC
             LIMIT $4 OFFSET $5
             """,
@@ -250,9 +273,10 @@ async def alert_buckets(
     # selection doesn't shrink its own option list.
     zone_opts_rows = await db.fetch(
         """
-        SELECT DISTINCT a.zone_id, COALESCE(z.name, a.zone_id) AS zone_name
+        SELECT DISTINCT a.zone_id, COALESCE(z.name, g.name, a.zone_id) AS zone_name
         FROM vehicle_alerts a
         LEFT JOIN zones z ON z.zone_id = a.zone_id
+        LEFT JOIN zone_groups g ON g.group_id = a.zone_id
         WHERE a.alert_type = $1 AND a.ts >= $2 AND a.ts < $3
         ORDER BY zone_name
         """,

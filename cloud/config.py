@@ -25,6 +25,15 @@ class Settings(BaseSettings):
     probe_camera_snapshots: bool = False
     mqtt_ingest_queue_max: int = 1000
 
+    # Overstay alerts arrive on an escalating milestone ladder from the edge
+    # (15m/30m/60m/hourly by default), one message per milestone. This window
+    # only collapses a *near-immediate* duplicate of the same milestone (e.g. an
+    # edge re-send after a restart when its Redis state was unavailable) into the
+    # existing row. It MUST stay well below the smallest milestone gap (= the
+    # zone's overstay threshold, 15 min by default) so genuine, distinct
+    # milestones are never merged. See cloud/modules/ingestion/mqtt_consumer.py.
+    overstay_alert_dedup_window_s: int = 120
+
     # --- Web security -------------------------------------------------------
     # CORS is restricted to the approved dashboard origin(s) only — no wildcard
     # (security observation #6). Comma-separated. In production set

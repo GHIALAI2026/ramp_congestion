@@ -343,7 +343,7 @@ a{color:inherit}
    plotted in % coordinates land in the right spot across all viewports. */
 .zone-map{
   position:relative;width:100%;aspect-ratio:1561/429;
-  background-image:url(/static/zone_map.png?v=20260608);
+  background-image:url(/static/zone_map.png);
   background-size:contain;background-repeat:no-repeat;background-position:top left;
   background-color:#f1f5f9;border:1px solid var(--line);border-radius:12px
 }
@@ -1042,20 +1042,13 @@ body.viewer-mode #nav-feed{display:none !important}
               <option value="overstay">Overstay</option>
               <option value="camera_offline">Camera offline</option>
             </select>
-            <select id="alert-severity-filter" class="alerts-select" onchange="fetchAlertsFull()">
+            <select id="alert-severity-filter" class="alerts-select" onchange="alertsPageIndex=0; renderAlertsFull()">
               <option value="">All severities</option>
               <option value="critical">Critical only</option>
               <option value="warning">Warning only</option>
             </select>
-            <select id="alert-zone-filter" class="alerts-select" onchange="fetchAlertsFull()">
+            <select id="alert-zone-filter" class="alerts-select" onchange="alertsPageIndex=0; renderAlertsFull()">
               <option value="">All zones</option>
-            </select>
-            <select id="alert-time-filter" class="alerts-select" onchange="fetchAlertsFull()">
-              <option value="">All time</option>
-              <option value="3">Last 3 hours</option>
-              <option value="6">Last 6 hours</option>
-              <option value="12">Last 12 hours</option>
-              <option value="24">Last 24 hours</option>
             </select>
             <label class="check-inline"><input type="checkbox" id="alert-unacked-only" checked onchange="fetchAlertsFull()">Unacknowledged only</label>
             <label class="check-inline" for="alerts-per-page" style="gap:6px">Per page
@@ -1177,7 +1170,7 @@ body.viewer-mode #nav-feed{display:none !important}
               <tr>
                 <th>Zone ID</th>
                 <th>Name</th>
-                <th title="Which slot on the Overview ramp map this zone feeds into. Floor plan only renders zones whose name (or group name) is one of OUTER-1..OUTER-6 or INNER-1..INNER-6 (case-sensitive).">Map slot</th>
+                <th title="Which slot on the Overview ramp map this zone feeds into. Floor plan only renders zones whose name (or group name) is one of Zone 1..Zone 12 (case-sensitive).">Map slot</th>
                 <th>Ramp Side</th>
                 <th>Camera</th>
                 <th>Max Vehicles</th>
@@ -1257,17 +1250,17 @@ body.viewer-mode #nav-feed{display:none !important}
             <button type="button" class="btn" id="f-zone-group-edit-btn" onclick="openGroupEditor('edit')" title="Edit the selected group" disabled>Edit</button>
             <button type="button" class="btn" id="f-zone-group-new-btn" onclick="openGroupEditor('create')" title="Create a new group">+ New</button>
           </div>
-          <div class="zone-help" style="margin-top:6px">A group aggregates this camera's count with other cameras that cover the same physical zone (e.g. "OUTER-5" seen from 4 angles).</div>
+          <div class="zone-help" style="margin-top:6px">A group aggregates this camera's count with other cameras that cover the same physical zone (e.g. "Zone 5" seen from 4 angles).</div>
 
           <div id="zone-group-creator" hidden style="margin-top:10px;padding:12px 14px;border:1px solid var(--line);border-radius:10px;background:#f8fafc">
             <div id="f-group-editor-title" style="font-weight:700;font-size:13px;color:#0f172a;margin-bottom:8px">New group</div>
             <div class="form-group" style="margin-bottom:8px">
               <label>Name</label>
-              <input id="f-new-group-name" placeholder="OUTER-5" oninput="onNewGroupNameInput()">
+              <input id="f-new-group-name" placeholder="Zone 5" oninput="onNewGroupNameInput()">
             </div>
             <div class="form-group" style="margin-bottom:8px">
               <label>Group ID</label>
-              <input id="f-new-group-id" placeholder="zg-outer-5">
+              <input id="f-new-group-id" placeholder="zg-zone-5">
             </div>
             <div class="form-group" style="margin-bottom:0">
               <label>Max vehicles for the whole group <span style="font-weight:400;color:var(--muted)">(optional)</span></label>
@@ -1313,11 +1306,6 @@ body.viewer-mode #nav-feed{display:none !important}
 <script>
 const API = '';
 let ws, zoneData = {}, alertData = [], fullAlertData = [], overviewData = {};
-// Authoritative group_id -> display name (e.g. "zg-zone-11" -> "INNER-2").
-// Populated from /api/overview and /api/zone_groups. Used so any view that
-// only has a group_id (group-level overcrowding alerts, the Overview tiles)
-// shows the friendly INNER-N / OUTER-N label instead of the raw zg- id.
-let groupNamesById = {};
 
 // Map an alert's zone_id to a human label.
 // Overstay alerts carry a real per-camera zone_id; overcrowding alerts may
@@ -1328,14 +1316,14 @@ function alertZoneLabel(zoneId){
   if(!zoneId) return '';
   const z = zoneData[zoneId];
   if(z){
-    return z.group_name || z.name || groupNamesById[zoneId] || zoneId;
+    return z.group_name || z.name || zoneId;
   }
   for(const candidate of Object.values(zoneData)){
     if(candidate.zone_group_id === zoneId && candidate.group_name){
       return candidate.group_name;
     }
   }
-  return groupNamesById[zoneId] || zoneId;
+  return zoneId;
 }
 // Server-authoritative counts for the Alerts stat cards. Populated by the
 // /api/alerts response (which now returns {alerts, counts}). The acked
@@ -1426,7 +1414,11 @@ function alertHeadline(alert){
   const lead = zoneLabel ? `${zoneLabel} — ` : '';
   if(type === 'overstay' && alert.dwell_time_s != null){
     const dwell = Number(alert.dwell_time_s);
+    const thresh = Number(zoneData[alert.zone_id]?.max_dwell_time_s || 0);
     const dwellTxt = fmtDuration(dwell);
+    if(thresh > 0 && dwell > thresh){
+      return `${lead}Overstay ${dwellTxt} in zone, ${fmtDuration(dwell - thresh)} over limit`;
+    }
     return `${lead}Overstay ${dwellTxt} in zone`;
   }
   if(type === 'overcrowding' && alert.vehicle_count != null){
@@ -1895,19 +1887,7 @@ function mergeAlertItems(items, incoming, limit = 50){
 function alertMatchesPageFilter(alert){
   const type = $('alert-filter')?.value || '';
   const unackedOnly = Boolean($('alert-unacked-only')?.checked);
-  if(type && alert.alert_type !== type) return false;
-  if(unackedOnly && alert.acknowledged) return false;
-  // Mirror the dropdown filters so a live alert merged over the WebSocket
-  // doesn't slip into fullAlertData under a severity/zone/time filter it
-  // doesn't actually match (the server already excludes it from fetches).
-  const {sev, zoneSel, hours} = getAlertScopeFilters();
-  if(sev && (alert.level || 'warning') !== sev) return false;
-  if(zoneSel && alertZoneLabel(alert.zone_id) !== zoneSel) return false;
-  if(hours > 0){
-    const ts = typeof alert.ts === 'number' ? alert.ts : new Date(alert.ts).getTime() / 1000;
-    if(ts < (Date.now() / 1000) - hours * 3600) return false;
-  }
-  return true;
+  return (!type || alert.alert_type === type) && (!unackedOnly || !alert.acknowledged);
 }
 
 function normalizePage(page){
@@ -2159,7 +2139,6 @@ function loadZoneGroups(selectedGroupId = ''){
     .then(groups => {
       const opts = ['<option value="">— No group (standalone zone) —</option>'];
       for(const g of (groups || [])){
-        if(g.group_id && g.name) groupNamesById[g.group_id] = g.name;
         const mem = g.zone_count ? ` (${g.zone_count} cams)` : '';
         opts.push(`<option value="${escapeHtml(g.group_id)}">${escapeHtml(g.name)}${mem}</option>`);
       }
@@ -2524,13 +2503,13 @@ function buildLogicalZones(){
         // Use group_id as the synthetic zone_id so renderers that key on
         // zone_id (sorting, the hotspot-id set) still work unchanged.
         zone_id: gid,
-        name: z.group_name || groupNamesById[gid] || gid,
+        name: z.group_name || gid,
         camera_id: null,  // populated below as "N feeds"
         vehicle_count: 0,
         // Group's max_vehicles is the threshold the operator set on the
         // group itself — independent of any single member camera's
         // max_vehicles, which was an unrelated per-feed setting.
-        max_vehicles: (z.group_max_vehicles == null ? null : Number(z.group_max_vehicles)),
+        max_vehicles: Number(z.group_max_vehicles || 0),
         overstay_count: 0,
         max_dwell_time_s: 0,
         _avg_weighted: 0,
@@ -2567,29 +2546,26 @@ function buildLogicalZones(){
 // (zone_groups.name for grouped zones; zones.name for standalones) since
 // the user confirmed those match the on-image "ZONE-N" labels.
 //
-// Image layout: the top row is the OUTER ramp, labelled OUTER-6→OUTER-1
-// left-to-right; the bottom row is the INNER ramp, labelled INNER-6→INNER-1
-// left-to-right (these match the relabelled on-image OUTER-/INNER- text).
-// Every entry here renders an overlay — entries without a matching DB zone
-// show up as a gray placeholder so the operator sees the full floor plan,
+// Image layout: top row labels go 6→5→4→3→2→1 left-to-right;
+// bottom row labels go 7→8→9→10→11→12 left-to-right. Every entry
+// here renders an overlay — entries without a matching DB zone show
+// up as a gray placeholder so the operator sees the full floor plan,
 // not gaps where unmonitored zones sit.
 const ZONE_MAP_POSITIONS = {
-  // Top row — outer ramp
-  'OUTER-6': { left: 10, top: 22 },
-  'OUTER-5': { left: 27, top: 22 },
-  'OUTER-4': { left: 47, top: 22 },
-  'OUTER-3': { left: 66, top: 22 },
-  'OUTER-2': { left: 81, top: 22 },
-  'OUTER-1': { left: 97, top: 22 },
-  // Bottom row — inner ramp. Sit the chips BELOW the baked INNER-* labels
-  // (which sit ~66%) so the floor-plan labels/lanes stay visible, mirroring
-  // how the outer chips sit above their labels.
-  'INNER-6': { left: 12, top: 78 },
-  'INNER-5': { left: 27, top: 78 },
-  'INNER-4': { left: 47, top: 78 },
-  'INNER-3': { left: 64, top: 78 },
-  'INNER-2': { left: 79, top: 78 },
-  'INNER-1': { left: 93, top: 78 },
+  // Top row
+  'Zone 6':  { left: 10, top: 22 },
+  'Zone 5':  { left: 31, top: 22 },
+  'Zone 4':  { left: 51, top: 22 },
+  'Zone 3':  { left: 70, top: 22 },
+  'Zone 2':  { left: 85, top: 22 },
+  'Zone 1':  { left: 97, top: 22 },
+  // Bottom row
+  'Zone 7':  { left: 12, top: 66 },
+  'Zone 8':  { left: 27, top: 66 },
+  'Zone 9':  { left: 47, top: 66 },
+  'Zone 10': { left: 64, top: 66 },
+  'Zone 11': { left: 79, top: 66 },
+  'Zone 12': { left: 93, top: 66 },
 };
 
 function renderThresholdSummary(){
@@ -2626,21 +2602,16 @@ function renderThresholdSummary(){
       continue;
     }
     const count = parseInt(zone.vehicle_count || 0, 10);
-    // Distinguish a real threshold of 0 from "no threshold set". A bare
-    // `max || '—'` renders 0 as '—' because 0 is falsy in JS — so show the
-    // number (including 0) whenever a cap exists, and '—' only when it's null.
-    const rawMax = zone.max_vehicles;
-    const max = (rawMax === null || rawMax === undefined || rawMax === '') ? null : parseInt(rawMax, 10);
-    const maxLabel = (max === null || Number.isNaN(max)) ? '—' : max;
+    const max = parseInt(zone.max_vehicles || 0, 10);
     const pct = Math.min(999, zoneOccupancyPct(zone));
     const matchedBand = OCCUPANCY_BANDS.find(b => b.test(zone));
     const tone = matchedBand ? matchedBand.tone : occupancyTone(pct);
     const barWidth = Math.max(0, Math.min(pct, 100));
     overlays.push(`
       <div class="zone-overlay ${tone}" style="left:${pos.left}%;top:${pos.top}%"
-           title="${escapeHtml(key)}: ${count}/${maxLabel} (${pct.toFixed(0)}%)">
+           title="${escapeHtml(key)}: ${count}/${max || '—'} (${pct.toFixed(0)}%)">
         <div class="zo-name">${escapeHtml(key)}</div>
-        <div class="zo-count">${count}<span class="zo-max"> / ${escapeHtml(String(maxLabel))}</span></div>
+        <div class="zo-count">${count}<span class="zo-max"> / ${escapeHtml(max || '—')}</span></div>
         <div class="zo-bar"><div style="width:${barWidth}%"></div></div>
       </div>
     `);
@@ -2742,36 +2713,13 @@ function onAlertsPerPageChange(){
   renderAlertsFull();
 }
 
-// The dropdown filters (severity / zone / time) narrow the dataset itself —
-// they define the "scope" the operator is looking at. The free-text search box
-// is a find-within on top of that scope. Splitting them lets the stat cards
-// summarise the scope (so they react to the dropdowns) without being thrown off
-// by an in-progress search. `active` tells callers whether to fall back to the
-// server-supplied counts (no dropdown filter) or derive from the scoped set.
-function getAlertScopeFilters(){
-  const sev = $('alert-severity-filter')?.value || '';
-  const zoneSel = $('alert-zone-filter')?.value || '';
-  const hours = parseFloat($('alert-time-filter')?.value || '');
-  return {sev, zoneSel, hours, active: Boolean(sev || zoneSel || hours > 0)};
-}
-
-function getAlertsScopedData(){
-  const {sev, zoneSel, hours} = getAlertScopeFilters();
-  const cutoff = hours > 0 ? (Date.now() / 1000) - hours * 3600 : 0;
-  return fullAlertData
-    .filter(a => !sev || (a.level || 'warning') === sev)
-    .filter(a => !zoneSel || alertZoneLabel(a.zone_id) === zoneSel)
-    .filter(a => {
-      if(!cutoff) return true;
-      const ts = typeof a.ts === 'number' ? a.ts : new Date(a.ts).getTime() / 1000;
-      return ts >= cutoff;
-    });
-}
-
 function getAlertsPageVisible(){
   const q = ($('alerts-search')?.value || '').trim().toLowerCase();
   const sev = $('alert-severity-filter')?.value || '';
-  return getAlertsScopedData()
+  const zoneSel = $('alert-zone-filter')?.value || '';
+  return fullAlertData
+    .filter(a => !sev || (a.level || 'warning') === sev)
+    .filter(a => !zoneSel || alertZoneLabel(a.zone_id) === zoneSel)
     .filter(a => {
       if(!q) return true;
       return [a.message, a.zone_id, a.camera_id, a.track_id != null ? '#' + a.track_id : '']
@@ -2799,14 +2747,12 @@ function renderAlertsFull(){
   if(!el) return;
   renderAlertZoneOptions();
 
-  // Stats come from the server-supplied counts, which are computed in SQL over
-  // the WHOLE table matching every active filter (type / severity / zone /
-  // time). That's the key reason all four filters now route through
-  // fetchAlertsFull: a client-side count would be capped at the ~500 rows we
-  // fetch (and ~50 after live updates), so filtering would wrongly shrink the
-  // cards. Server counts survive reload and ignore unacked-only (so "Acked
-  // today" isn't forced to 0 by the list filter). Fall back to deriving from
-  // fullAlertData only against a legacy flat-array cloud that sends no counts.
+  // Stats reflect the FULL fetched set (not the search-filtered view), so the
+  // operator always sees true severity counts at the top.
+  // Prefer server-supplied counts (survive reload, reflect the full DB
+  // matching the zone/type filter, ignore unacked-only). Fall back to
+  // deriving from fullAlertData if the server response is the legacy flat
+  // array (e.g. against an older cloud).
   const total = fullAlertCounts?.total ?? fullAlertData.length;
   const critical = fullAlertCounts?.critical ?? fullAlertData.filter(a => a.level === 'critical').length;
   const warning = fullAlertCounts?.warning ?? fullAlertData.filter(a => a.level === 'warning').length;
@@ -3136,17 +3082,8 @@ function renderAnalytics(data){
     // "critical" — red has semantic weight that didn't correspond to anything.
     const tone = count === 0 ? 'zero' : 'amber';
     const valueLabel = count > 0 ? `<span class="analytics-bar-value">${count}</span>` : '';
-    // Hover tooltip: bucket summary + a per-zone breakdown of where the
-    // alerts came from (e.g. "OUTER-1: 4"), highest first. Only zones with
-    // alerts are listed; an empty bucket shows just the summary line.
-    // &#10; renders as a newline inside the native title tooltip.
-    const summary = `${escapeHtml(b.label)}: ${count} ${count === 1 ? unit.unit : unit.plural}`;
-    const zoneLines = (b.zones || [])
-      .map(z => `${escapeHtml(z.zone_name || z.zone_id)}: ${Number(z.count || 0)}`)
-      .join('&#10;');
-    const barTitle = zoneLines ? `${summary}&#10;${zoneLines}` : summary;
     return `
-      <div class="analytics-bar-cell" title="${barTitle}">
+      <div class="analytics-bar-cell" title="${escapeHtml(b.label)}: ${count} ${count === 1 ? unit.unit : unit.plural}">
         <div class="analytics-bar-track">
           <div class="analytics-bar-fill ${tone}" style="height:${pct.toFixed(1)}%">${valueLabel}</div>
         </div>
@@ -3264,7 +3201,6 @@ function fetchAll(){
     const nextZoneData = {};
     if(data.zones) data.zones.forEach(z => {
       nextZoneData[z.zone_id] = {...(zoneData[z.zone_id] || {}), ...z};
-      if(z.zone_group_id && z.group_name) groupNamesById[z.zone_group_id] = z.group_name;
     });
     zoneData = nextZoneData;
     renderThresholdSummary();
@@ -3319,11 +3255,11 @@ function renderZoneSlotCell(zone, slotOwners){
   const slot = zoneMapSlot(zone);
   const onMap = slot && Object.prototype.hasOwnProperty.call(ZONE_MAP_POSITIONS, slot);
   if(!onMap){
-    // Slot label doesn't match any OUTER-N / INNER-N floor-plan position.
-    // Most common causes: case mismatch (e.g. "outer-1" vs "OUTER-1"),
+    // Slot label doesn't match any "Zone N" floor-plan position.
+    // Most common causes: case mismatch (e.g. "zone 12" vs "Zone 12"),
     // typo, or an orphan/duplicate zone the operator forgot about.
     const tip = slot
-      ? `Label "${slot}" doesn't match any floor-plan slot. Expected one of OUTER-1..OUTER-6 or INNER-1..INNER-6 (case-sensitive). This zone will NOT appear on the Ramp Map.`
+      ? `Label "${slot}" doesn't match any floor-plan slot. Expected one of Zone 1..Zone 12 (case-sensitive). This zone will NOT appear on the Ramp Map.`
       : 'No display name yet — this zone will NOT appear on the Ramp Map.';
     return `<td><span style="color:#999;font-style:italic" title="${escapeHtml(tip)}">— not mapped</span></td>`;
   }
@@ -3402,36 +3338,15 @@ function fetchZones(){
   });
 }
 
-// A dashboard zone filter is a friendly label (group_name or name) that can
-// cover several zone_ids when zones are grouped. Resolve it to every matching
-// id so the server can narrow by ANY(id) — matching the client-side label
-// filtering in getAlertsScopedData().
-function alertZoneIdsForLabel(label){
-  if(!label) return [];
-  const ids = [];
-  for(const z of Object.values(zoneData)){
-    if((z.group_name || z.name) === label && z.zone_id) ids.push(z.zone_id);
-  }
-  return ids;
-}
-
 function fetchAlertsFull(){
-  // A new server fetch usually means filters changed (type/severity/zone/time/
-  // unacked) or the operator hit Refresh — either way, start at page 1. All
-  // filters go to the server so the stat cards reflect a true full-DB count for
-  // the selected slice, not just the limit-capped rows we render.
+  // A new server fetch usually means filters changed (type/unacked toggled)
+  // or the operator hit Refresh — either way, start at page 1.
   alertsPageIndex = 0;
   const type = $('alert-filter').value;
   const unackedOnly = $('alert-unacked-only').checked;
-  const level = $('alert-severity-filter')?.value || '';
-  const hours = $('alert-time-filter')?.value || '';
-  const zoneIds = alertZoneIdsForLabel($('alert-zone-filter')?.value || '');
-  let url = API + '/api/alerts?limit=500'
+  const url = API + '/api/alerts?limit=500'
     + (type ? '&alert_type=' + encodeURIComponent(type) : '')
-    + (level ? '&level=' + encodeURIComponent(level) : '')
-    + (hours ? '&since_hours=' + encodeURIComponent(hours) : '')
     + (unackedOnly ? '&unacked_only=true' : '');
-  for(const zid of zoneIds) url += '&zone_id=' + encodeURIComponent(zid);
   fetch(url).then(r => r.json()).then(data => {
     // New shape: {alerts, counts}. Tolerate the old flat-array shape too so
     // a stale cloud doesn't blank the page during rollout.
@@ -3580,26 +3495,9 @@ function setLiveInspector(cameraId){
 }
 
 function fetchLive(){
-  // Fetch cameras and zones together so the dropdown can show which zones
-  // each camera covers, e.g. "arrival_cam_15 (OUTER-5, OUTER-6)". Zones fetch
-  // is best-effort — if it fails we still render plain camera labels.
-  Promise.all([
-    fetch(API + '/api/cameras').then(r => r.json()),
-    fetch(API + '/api/zones').then(r => r.json()).catch(() => []),
-  ]).then(([cams, zones]) => {
+  fetch(API + '/api/cameras').then(r => r.json()).then(cams => {
     const el = $('live-feeds');
     const select = $('live-camera-select');
-    // Build camera_id -> [zone display labels]. Use the zone's name (the
-    // OUTER-*/INNER-* label operators recognise), de-duped and natural-sorted.
-    const zonesByCam = {};
-    (zones || []).forEach(z => {
-      if(!z.camera_id) return;
-      const label = z.name || z.zone_id;
-      const list = (zonesByCam[z.camera_id] = zonesByCam[z.camera_id] || []);
-      if(!list.includes(label)) list.push(label);
-    });
-    Object.values(zonesByCam).forEach(list => list.sort((a, b) =>
-      String(a).localeCompare(String(b), undefined, {numeric: true, sensitivity: 'base'})));
     // Sort by displayed label using natural order, so arrival_cam_2 sits
     // before arrival_cam_10 instead of after (lexicographic would put
     // cam_10/11/12/.../18 above cam_2/3/.../9).
@@ -3617,12 +3515,7 @@ function fetchLive(){
       selectedLiveCamera = null;
       return;
     }
-    select.innerHTML = cams.map(cam => {
-      const base = cam.name || cam.camera_id;
-      const zs = zonesByCam[cam.camera_id];
-      const label = (zs && zs.length) ? `${base} (${zs.join(', ')})` : base;
-      return `<option value="${escapeHtml(cam.camera_id)}">${escapeHtml(label)}</option>`;
-    }).join('');
+    select.innerHTML = cams.map(cam => `<option value="${escapeHtml(cam.camera_id)}">${escapeHtml(cam.name || cam.camera_id)}</option>`).join('');
     const activeCamera = cams.find(cam => cam.camera_id === selectedLiveCamera) || cams[0];
     setLiveInspector(activeCamera.camera_id);
   }).catch(() => {

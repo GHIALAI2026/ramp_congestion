@@ -222,13 +222,22 @@ def _analytics_shard_proc(
                     last_ts = cam_pub_ts.get(zid, 0.0)
                     if ts - last_ts < 1.0:
                         continue
-                    metrics = zone_obj.update(
-                        tracked, frame_w, frame_h, ts, inf_ms, fps,
-                    )
-                    mqtt_pub.publish_metrics(metrics)
-                    for alert in zone_obj.check_alerts(metrics, ts):
-                        mqtt_pub.publish_alert(alert)
-                    cam_pub_ts[zid] = ts
+                    # Isolate metrics/alert publishing per zone so a broker hiccup
+                    # or an alert-calc error can't abort the frame and starve the
+                    # UI overlay signal below — the live preview must keep drawing
+                    # zone outlines even when the broker is down.
+                    try:
+                        metrics = zone_obj.update(
+                            tracked, frame_w, frame_h, ts, inf_ms, fps,
+                        )
+                        mqtt_pub.publish_metrics(metrics)
+                        for alert in zone_obj.check_alerts(metrics, ts):
+                            mqtt_pub.publish_alert(alert)
+                        cam_pub_ts[zid] = ts
+                    except Exception:
+                        proc_logger.exception(
+                            "Shard %d zone %s metrics/alert error", shard_idx, zid,
+                        )
 
                 # Wake the UI worker only when:
                 #   - someone is watching this camera, AND

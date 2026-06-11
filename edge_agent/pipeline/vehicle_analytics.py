@@ -76,12 +76,13 @@ class VehicleZoneAnalytics:
         # Smoothing: 5-frame median filter for vehicle count
         self._recent_counts: deque[int] = deque(maxlen=5)
 
-        # Per-track last overstay-alert timestamp. Replaces the older
-        # _alerted_overstay_ids set, which only fired once per visit and
-        # produced alerts permanently frozen at exactly max_dwell_time_s.
-        # Now we re-fire every cfg.OVERSTAY_REALERT_INTERVAL_S so the dwell
-        # value tracks reality on long stays.
-        self._last_overstay_alert_ts: dict[int, float] = {}
+        # Per-track index of the highest overstay milestone already fired
+        # (see check_alerts / cfg.OVERSTAY_* for the ladder). A track only
+        # emits an alert when it crosses a *new* milestone, so each step in
+        # the 15m/30m/60m/hourly escalation fires exactly once per visit.
+        # Persisted to Redis so an edge restart doesn't replay a milestone
+        # the operator has already seen.
+        self._last_overstay_milestone: dict[int, int] = {}
 
         # Overcrowding alert state
         self._overcrowding_active: bool = False
@@ -144,6 +145,45 @@ class VehicleZoneAnalytics:
             return
         try:
             self._redis.delete(self._redis_key(tid))
+        except Exception:
+            # Failure to clean up is harmless — TTL will reap it.
+            pass
+
+    def _redis_milestone_key(self, tid: int) -> str:
+        return f"vzone:msalert:{self._cfg.zone_id}:{tid}"
+
+    def _redis_get_milestone(self, tid: int) -> Optional[int]:
+        """Return the last-fired overstay milestone index for `tid`, or None."""
+        if self._redis is None:
+            return None
+        try:
+            raw = self._redis.get(self._redis_milestone_key(tid))
+            return int(raw) if raw is not None else None
+        except Exception as e:
+            if not self._redis_warned:
+                _log.warning("Redis GET (milestone) failed for zone %s: %s",
+                             self._cfg.zone_id, e)
+                self._redis_warned = True
+            return None
+
+    def _redis_set_milestone(self, tid: int, idx: int) -> None:
+        if self._redis is None:
+            return
+        try:
+            # Same TTL policy as the entry key so the two expire together.
+            ttl = max(60, int(self._cfg.max_dwell_time_s * cfg.OVERSTAY_ENTRY_TTL_MULTIPLIER))
+            self._redis.set(self._redis_milestone_key(tid), str(int(idx)), ex=ttl)
+        except Exception as e:
+            if not self._redis_warned:
+                _log.warning("Redis SET (milestone) failed for zone %s: %s",
+                             self._cfg.zone_id, e)
+                self._redis_warned = True
+
+    def _redis_del_milestone(self, tid: int) -> None:
+        if self._redis is None:
+            return
+        try:
+            self._redis.delete(self._redis_milestone_key(tid))
         except Exception:
             # Failure to clean up is harmless — TTL will reap it.
             pass
@@ -268,8 +308,9 @@ class VehicleZoneAnalytics:
                 self._zone_class.pop(tid, None)
                 self._zone_bbox.pop(tid, None)
                 self._total_exited += 1
-                self._last_overstay_alert_ts.pop(tid, None)
+                self._last_overstay_milestone.pop(tid, None)
                 self._redis_del_entry(tid)
+                self._redis_del_milestone(tid)
 
         # Clean up stale entries
         for tid in list(self._zone_entry.keys()):
@@ -277,8 +318,9 @@ class VehicleZoneAnalytics:
                 del self._zone_entry[tid]
                 self._zone_class.pop(tid, None)
                 self._zone_bbox.pop(tid, None)
-                self._last_overstay_alert_ts.pop(tid, None)
+                self._last_overstay_milestone.pop(tid, None)
                 self._redis_del_entry(tid)
+                self._redis_del_milestone(tid)
 
         self._prev_zone_ids = current_zone_ids
 
@@ -331,26 +373,69 @@ class VehicleZoneAnalytics:
             inf_ms=round(inf_ms, 1),
         )
 
-    def check_alerts(self, metrics: VehicleZoneMetrics, ts: float) -> list[VehicleAlert]:
-        """Generate edge-side overstay alerts.
+    def _overstay_milestone(self, ratio: float) -> tuple[Optional[int], Optional[str]]:
+        """Map a dwell÷threshold ratio to the highest overstay milestone reached.
 
-        A given track fires its first overstay alert as soon as dwell crosses
-        ``max_dwell_time_s``, then re-fires every ``OVERSTAY_REALERT_INTERVAL_S``
-        while it remains in the zone. Each re-fire carries the current (larger)
-        dwell value, so a long stay produces a sequence of alerts at growing
-        dwell times instead of one row frozen at the threshold. The per-tid
-        state is cleared when the vehicle leaves the zone.
+        Returns ``(milestone_index, level)`` or ``(None, None)`` if the ratio
+        hasn't reached the first milestone. Indices are contiguous and
+        monotonic: the warning milestones occupy ``0 .. len(warn)-1`` and the
+        criticals continue from there, so a strictly increasing dwell yields a
+        strictly increasing index — which is what check_alerts() uses to fire
+        each step exactly once.
+
+        With the defaults (warn at 1x/2x T, critical from 4x T every 4x T) and
+        T = 15 min this gives: 15m→idx0 (warn), 30m→idx1 (warn),
+        60m→idx2 (crit), 120m→idx3 (crit), 180m→idx4 (crit), ...
+        """
+        warn = sorted(cfg.OVERSTAY_WARN_MULTIPLES)
+        crit_start = cfg.OVERSTAY_CRIT_START_MULTIPLE
+        crit_interval = cfg.OVERSTAY_CRIT_INTERVAL_MULTIPLE
+
+        idx: Optional[int] = None
+        level: Optional[str] = None
+        for i, m in enumerate(warn):
+            if ratio >= m:
+                idx, level = i, "warning"
+        if ratio >= crit_start:
+            steps = int((ratio - crit_start) // crit_interval) if crit_interval > 0 else 0
+            idx = len(warn) + steps
+            level = "critical"
+        return idx, level
+
+    def check_alerts(self, metrics: VehicleZoneMetrics, ts: float) -> list[VehicleAlert]:
+        """Generate edge-side overstay alerts on an escalating milestone ladder.
+
+        Dwell is measured against the zone's ``max_dwell_time_s`` (T). A track
+        fires once at each milestone it crosses (see _overstay_milestone and
+        cfg.OVERSTAY_*): by default warnings at T and 2T, then a critical at 4T
+        and every 4T thereafter. Each alert carries the current dwell value, so
+        a long stay produces a sequence of escalating alerts rather than one
+        frozen row. The last-fired milestone index is tracked per track (and
+        mirrored to Redis) so a step never re-fires and a restart doesn't
+        replay an already-seen milestone. State is cleared when the vehicle
+        leaves the zone.
         """
         alerts: list[VehicleAlert] = []
-        realert_interval = float(cfg.OVERSTAY_REALERT_INTERVAL_S)
+        threshold = self._cfg.max_dwell_time_s
 
         for tid in metrics.overstay_alert_ids:
-            last_alert_ts = self._last_overstay_alert_ts.get(tid)
-            if last_alert_ts is not None and (ts - last_alert_ts) < realert_interval:
-                continue
             dwell = ts - self._zone_entry.get(tid, ts)
-            threshold = self._cfg.max_dwell_time_s
-            level = "critical" if dwell > threshold * 2 else "warning"
+            ratio = dwell / threshold if threshold > 0 else 0.0
+            idx, level = self._overstay_milestone(ratio)
+            if idx is None:
+                continue
+
+            last_idx = self._last_overstay_milestone.get(tid)
+            if last_idx is None:
+                # First time this process handles the track's overstay. Consult
+                # Redis so a restart doesn't replay a milestone already emitted
+                # for this (zone, track) by a prior edge process.
+                last_idx = self._redis_get_milestone(tid)
+                if last_idx is not None:
+                    self._last_overstay_milestone[tid] = last_idx
+            if last_idx is not None and idx <= last_idx:
+                continue
+
             bbox = self._zone_bbox.get(tid)
             alerts.append(VehicleAlert(
                 edge_id=self._edge_id,
@@ -369,6 +454,7 @@ class VehicleZoneAnalytics:
                 frame_h=self._last_frame_h or None,
                 zone_poly=self._zone_poly_frame_coords(),
             ))
-            self._last_overstay_alert_ts[tid] = ts
+            self._last_overstay_milestone[tid] = idx
+            self._redis_set_milestone(tid, idx)
 
         return alerts

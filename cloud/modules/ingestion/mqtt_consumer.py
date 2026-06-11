@@ -321,15 +321,20 @@ class MQTTConsumer:
 
         ts_dt = datetime.fromtimestamp(msg.ts, tz=timezone.utc)
 
-        # Overstay re-fires (every OVERSTAY_REALERT_INTERVAL_S from the edge
-        # while a vehicle is still violating) collapse into ONE DB row per
-        # visit. We look for the most recent overstay alert with the same
-        # (zone_id, track_id) within a 15-minute window; longer gaps are
-        # treated as a fresh visit (handles edge restart + OC-SORT track-id
-        # reuse). Acked rows stop accepting updates entirely — the operator
-        # handled this vehicle, suppress further heartbeats until exit
-        # (the edge stops emitting once the track leaves the zone, so the
-        # silence is bounded by the vehicle's actual stay).
+        # The edge emits overstay alerts on an escalating milestone ladder
+        # (15m/30m/60m/hourly by default), one message per milestone, and is
+        # itself idempotent (it persists the last-fired milestone to Redis so a
+        # restart doesn't replay one). Each distinct milestone is therefore a
+        # distinct DB row — that's the escalation history the operator sees.
+        # This lookup exists only to absorb a *near-immediate* duplicate of the
+        # same milestone (e.g. an edge re-send right after a restart when its
+        # Redis state was unavailable): we collapse it into the existing row if
+        # one for the same (zone_id, track_id) appeared within the (small) dedup
+        # window. The window MUST stay below the smallest milestone gap (= the
+        # zone threshold, 15 min by default) so genuine milestones are never
+        # merged; longer gaps are treated as fresh rows (also handles OC-SORT
+        # track-id reuse across visits). Acked rows stop accepting updates
+        # entirely — the operator handled that specific alert.
         existing_alert_id: int | None = None
         existing_acked = False
         existing_image_url: str | None = None
@@ -341,10 +346,11 @@ class MQTTConsumer:
                     FROM vehicle_alerts
                     WHERE zone_id = $1 AND track_id = $2
                       AND alert_type = 'overstay'
-                      AND ts > NOW() - INTERVAL '15 minutes'
+                      AND ts > NOW() - make_interval(secs => $3)
                     ORDER BY ts DESC LIMIT 1
                     """,
                     msg.zone_id, msg.track_id,
+                    settings.overstay_alert_dedup_window_s,
                 )
                 if existing:
                     existing_alert_id = existing["alert_id"]

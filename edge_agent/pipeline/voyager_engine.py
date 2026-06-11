@@ -685,14 +685,22 @@ class VoyagerEngine:
         a single frame is logged and the iterator continues so 30
         cameras don't go dark because of one bad frame.
 
-        Exception to that: when the SDK terminates the InferenceStream
-        itself (Metis NPU timeout, GStreamer pipeline tear-down) the
-        stream object's pipeline list is wiped and every retry just
-        re-raises ``ValueError: No pipeline configs provided`` or a
-        related fatal. Catching-and-continuing produces an infinite log
-        spam at ~2 Hz while ``cams_active`` sits at 0. After a small
-        number of consecutive fatals we exit the process so the
-        ``start.sh`` supervisor can restart from scratch.
+        Exceptions to that:
+
+          * Drained stream — every source has detached and the SDK raises
+            ``ValueError: No pipeline configs provided`` (whole camera
+            network dropped at once). We do NOT kill the process: a restart
+            just finds the same unreachable cameras and crash-loops. Instead
+            ``_recover_stream_to_idle`` tears the stream down and re-arms the
+            cameras for background retry, then this thread exits; the stream
+            rebuilds lazily once a source is reachable again.
+
+          * True SDK wedge — ``InferenceStream terminated`` /
+            ``'NoneType' object is not iterable`` repeating, or a drained
+            stream whose ``stop()`` itself hangs. After ``FATAL_STREAK_LIMIT``
+            consecutive fatals we SIGKILL so ``start.sh`` restarts from
+            scratch (catching-and-continuing would just spam at ~2 Hz while
+            ``cams_active`` sits at 0).
         """
         if self._iter_cpu_set:
             from edge_agent.pipeline.cpu_topology import pin_current_thread
@@ -755,6 +763,22 @@ class VoyagerEngine:
             except Exception as e:
                 logger.exception("[Voyager] iteration loop error; continuing")
                 msg = str(e)
+                # Every source has drained from the stream — in production
+                # this means the whole camera network dropped at once (the
+                # 8 pm outage). SIGKILLing the process here is futile: the
+                # supervisor restarts, the fresh agent finds the same
+                # unreachable cameras, the SDK can't build a pipeline, and
+                # it crash-loops for hours. Instead tear the dead stream
+                # down to idle and let each CameraStream's background
+                # preflight-retry rebuild it once its source is reachable
+                # again (_add_source recreates the stream + iter thread).
+                # The process — and the cloud link — stay up, and recovery
+                # is automatic when the network returns. Only fall through
+                # to the SIGKILL path if the teardown can't complete, so a
+                # genuinely wedged SDK still gets reset.
+                if "No pipeline configs provided" in msg:
+                    if self._recover_stream_to_idle():
+                        return
                 if any(marker in msg for marker in FATAL_MARKERS):
                     fatal_streak += 1
                 else:
@@ -775,6 +799,94 @@ class VoyagerEngine:
                     # then reaps any survivors via pkill + fuser.
                     os.kill(os.getpid(), signal.SIGKILL)
                 time.sleep(FATAL_BACKOFF_S)
+
+    def _recover_stream_to_idle(self) -> bool:
+        """Tear a fully-drained InferenceStream down to idle (no restart).
+
+        Called from the iter loop when the SDK raises "No pipeline configs
+        provided" — every source has detached, typically because the whole
+        camera network dropped at once. Rather than SIGKILL the process
+        (which only crash-loops against the same unreachable cameras), we:
+
+          1. Stop the dead stream and drop all pipeline bookkeeping, so the
+             next ``_add_source`` recreates it from scratch.
+          2. Re-arm every still-registered camera via its error callback
+             (``CameraStream.mark_errored``), which detaches it and starts
+             the background preflight-retry. When a source becomes reachable
+             again the retry calls ``add_stream`` → ``_add_source``, which
+             recreates the stream and starts a fresh iter thread.
+
+        The current iter thread then exits (caller ``return``s). If a source
+        is reachable the stream rebuilds within seconds; if none are, the
+        agent sits cleanly idle (throughput heartbeats keep the start.sh
+        watchdog satisfied) until the network returns.
+
+        Returns True if teardown completed and the iter thread should exit;
+        False if ``stream.stop()`` hung, so the caller falls back to the
+        SIGKILL path and a genuinely wedged SDK still gets reset.
+        """
+        # Bound stream.stop(): a wedged SDK can hold C-side locks and hang
+        # here forever. If it doesn't return promptly, report failure and
+        # let the caller SIGKILL — exactly the old behavior for a true wedge.
+        stream = self._stream
+        if stream is not None:
+            stopped = threading.Event()
+
+            def _stop() -> None:
+                try:
+                    stream.stop()
+                except Exception as exc:
+                    logger.warning(
+                        "[Voyager] stream.stop() during idle recovery failed: %s",
+                        exc,
+                    )
+                finally:
+                    stopped.set()
+
+            threading.Thread(
+                target=_stop, daemon=True, name="Voyager-idle-stop",
+            ).start()
+            if not stopped.wait(timeout=10.0):
+                logger.error(
+                    "[Voyager] stream.stop() hung during idle recovery; "
+                    "falling back to process restart",
+                )
+                return False
+
+        with self._deploy_lock:
+            self._stream = None
+            self._stream_thread = None
+            self._pipelines.clear()
+            self._pipeline_source_counts.clear()
+            self._pipeline_broken.clear()
+
+        with self._lock:
+            self._sid_to_pipeline_idx.clear()
+            self._pipeline_last_frame_ts.clear()
+            cams = [c for c, running in self._running.items() if running]
+            err_cbs = {c: self._error_callbacks.get(c) for c in cams}
+            self._sid_to_cam.clear()
+            self._cam_to_sid.clear()
+
+        logger.warning(
+            "[Voyager] all sources gone; stream torn down to idle and "
+            "%d camera(s) re-armed for background retry (no process restart)",
+            len(cams),
+        )
+        # Invoke error callbacks OUTSIDE the engine locks — mark_errored
+        # re-enters the engine via remove_stream (and CameraStream's own
+        # locks), so holding _lock/_deploy_lock here would deadlock.
+        for cam_id in cams:
+            cb = err_cbs.get(cam_id)
+            if cb is None:
+                continue
+            try:
+                cb()
+            except Exception as exc:
+                logger.warning(
+                    "[Voyager] re-arm callback for %s failed: %s", cam_id, exc,
+                )
+        return True
 
     def _handle_frame_result(self, frame_result, registry) -> None:
         # Count every result Metis returns, before any Python-side filtering.

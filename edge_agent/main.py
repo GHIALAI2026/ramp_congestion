@@ -47,6 +47,45 @@ logging.basicConfig(
 )
 logger = logging.getLogger("vehicle-edge")
 
+
+async def _zone_config_resync_loop(store, camera_manager, stop_event, interval_s):
+    """Periodically re-fetch camera/zone config over HTTP and reconcile it.
+
+    The edge loads zone polygons once at startup (ConfigStore.load) and then
+    relies on the MQTT config push for live updates. When the broker is down
+    (a documented failure mode here), zones drawn or edited after startup never
+    reach the edge: the live preview renders the frame but with NO zone outline,
+    and counting silently runs on stale polygons. This HTTP self-heal closes the
+    gap independently of the broker.
+
+    It reuses the same reconcile path as the MQTT "sync" action:
+    sync_camera -> stream.update_zones (no stream restart), and the worker's
+    _sync_zones calls update_config on existing zones (dwell/overstay state
+    preserved), so re-running it on an unchanged config is a cheap no-op.
+    Best-effort: any failure is logged and retried on the next tick.
+    """
+    if interval_s <= 0:
+        return
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval_s)
+            break  # stop_event fired during the wait — shutting down
+        except asyncio.TimeoutError:
+            pass  # interval elapsed — time to re-sync
+        try:
+            cameras = await asyncio.to_thread(store.load)
+            for cam in cameras:
+                await asyncio.to_thread(
+                    camera_manager.sync_camera,
+                    cam.camera_id, cam.source_url, cam.zones,
+                )
+            logger.debug(
+                "Zone config re-sync: reconciled %d camera(s) over HTTP",
+                len(cameras),
+            )
+        except Exception:
+            logger.warning("Zone config re-sync failed (will retry)", exc_info=True)
+
 def _set_ulimit():
     try:
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
@@ -240,6 +279,12 @@ async def main():
     hb_task = asyncio.create_task(
         heartbeat_loop(mqtt_pub, camera_manager, engine, start_time, metrics_collector),
     )
+    # Broker-independent HTTP self-heal for zone config (polygons/thresholds).
+    resync_task = asyncio.create_task(
+        _zone_config_resync_loop(
+            store, camera_manager, stop_event, cfg.ZONE_CONFIG_RESYNC_INTERVAL_S,
+        ),
+    )
 
     logger.info("Edge agent running. Cameras streaming to zones.")
 
@@ -248,6 +293,7 @@ async def main():
     # Cleanup
     http_task.cancel()
     hb_task.cancel()
+    resync_task.cancel()
     throughput_logger.stop()
     listener.stop()
     camera_manager.stop_all()

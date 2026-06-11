@@ -15,6 +15,19 @@ MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
 CLOUD_API_URL = os.environ.get("CLOUD_API_URL", "http://localhost:8002")
 HTTP_PORT = int(os.environ.get("EDGE_HTTP_PORT", "8003"))
 
+# How often the edge re-fetches camera/zone config from the cloud over HTTP and
+# reconciles it into the running workers. The edge's *live* config channel is
+# the MQTT config push; when the broker is unavailable (a known failure mode in
+# this deployment) zones drawn or edited after startup never reach the edge, so
+# the live preview shows no zone outline and counting runs on stale polygons.
+# This periodic HTTP re-sync self-heals that gap independently of the broker.
+# It reuses the same reconcile path as the MQTT "sync" action (no stream
+# restart, dwell/overstay state preserved), so an unchanged config is a cheap
+# no-op. Set to 0 to disable.
+ZONE_CONFIG_RESYNC_INTERVAL_S = float(
+    os.environ.get("ZONE_CONFIG_RESYNC_INTERVAL_S", "60")
+)
+
 # Redis is used to persist per-track zone-entry timestamps across edge restarts,
 # so overstay alerts reflect the vehicle's actual continuous dwell rather than
 # "time since the current edge process first saw it." Without this, every
@@ -22,11 +35,23 @@ HTTP_PORT = int(os.environ.get("EDGE_HTTP_PORT", "8003"))
 # exactly max_dwell_time_s.
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/1")
 
-# How often to re-fire an overstay alert while a vehicle is still in the zone.
-# Each re-fire carries the current (growing) dwell value, so a vehicle parked
-# for an hour produces alerts at 15/20/25/.../60 min instead of one frozen
-# 15-min row.
-OVERSTAY_REALERT_INTERVAL_S = float(os.environ.get("OVERSTAY_REALERT_INTERVAL_S", "300"))
+# Overstay alert ladder. Instead of a flat re-fire interval, overstay alerts
+# escalate on milestones expressed as multiples of the zone's overstay
+# threshold T (= max_dwell_time_s). With the default T = 15 min:
+#   * warnings at 1x T and 2x T          -> 15 min, 30 min
+#   * first critical at 4x T             -> 60 min
+#   * then a critical every 4x T after   -> 120 min, 180 min, ... (hourly)
+# Each milestone fires exactly once per visit and carries the current
+# (growing) dwell value. Keeping them as multiples of T means the cadence
+# scales correctly when a zone's threshold is reconfigured.
+OVERSTAY_WARN_MULTIPLES = tuple(
+    float(x) for x in os.environ.get("OVERSTAY_WARN_MULTIPLES", "1,2").split(",")
+    if x.strip()
+)
+# First critical milestone and the spacing between subsequent criticals, both
+# as multiples of T. Defaults: critical from 4x T, repeating every 4x T.
+OVERSTAY_CRIT_START_MULTIPLE = float(os.environ.get("OVERSTAY_CRIT_START_MULTIPLE", "4"))
+OVERSTAY_CRIT_INTERVAL_MULTIPLE = float(os.environ.get("OVERSTAY_CRIT_INTERVAL_MULTIPLE", "4"))
 
 # Multiplier applied to max_dwell_time_s when setting Redis TTL on entry-time
 # keys. 4× means a vehicle whose Redis key was last written an hour ago (for
